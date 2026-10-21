@@ -1,0 +1,19 @@
+[package]
+name = "cinnamon-docker"
+version = "0.1.0"
+edition = "2021"
+authors = ["Santiago Molina"]
+description = "Panel de escritorio para el motor Docker y el stack compose de Cinnamon"
+license = "MIT"
+repository = "https://github.com/Canopus44/cinnamon-docker"
+readme = "README.md"
+keywords = ["docker", "egui", "compose", "gui", "linux"]
+categories = ["gui", "command-line-utilities"]
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "default_fonts"] }
+egui = "0.37"
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
