@@ -16,7 +16,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libx11-dev libxi-dev libxcursor-dev \
-            libxrandr-dev libgl1-mesa-dev libfontconfig1-dev pkg-config
+            libxrandr-dev libgl1-mesa-dev libfontconfig1-dev pkg-config \
+            libxml2-utils desktop-file-utils
 
       - name: Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -28,6 +29,12 @@ jobs:
 
       - name: Formato
         run: cargo fmt --check
+
+      - name: Assets y empaquetado
+        run: |
+          xmllint --noout assets/*.svg
+          desktop-file-validate packaging/cinnamon-docker.desktop
+          bash -n install.sh
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings

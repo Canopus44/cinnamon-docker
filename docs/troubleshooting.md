@@ -11,8 +11,8 @@ pkexec /usr/bin/systemctl start docker.socket docker
 pkexec /usr/bin/systemctl stop docker.socket docker
 ```
 
-Si `pkexec` no existe, la app cae a `systemctl` directo; en ese caso necesitas
-permisos o `sudo systemctl …` a mano. Comprueba el agente polkit:
+Si `pkexec` no existe, la app cae a `systemctl` directo; necesitas permisos o
+`sudo systemctl …` a mano. Comprueba el agente polkit:
 
 ```bash
 systemctl status polkit
@@ -34,8 +34,8 @@ sudo systemctl stop docker.socket
 
 Exit 137 = `SIGKILL`, casi siempre OOM. En Cinnamon, dos `ng serve`
 (`chat-frontend` y `erp-frontend`) en paralelo agotan la RAM. La app usa
-*Levantar todo (serie)*: un servicio cada vez y esperando `healthy`. No uses
-`docker compose up -d` a secas para el stack completo.
+**Levantar cinnamon** en serie: un servicio cada vez y esperando `healthy`. No
+uses `docker compose up -d` a secas para el stack completo.
 
 Revisa el consumo por contenedor en las tarjetas (CPU/RAM) o:
 
@@ -65,22 +65,90 @@ aplique. La app no usa `sudo` para el CLI de Docker: sólo para `systemctl`.
 
 ## La ruta de compose no existe
 
-`COMPOSE_FILE` está fijada a:
+La ruta por defecto es la del autor. Si tu proyecto está en otro sitio, define
+`CINNAMON_DOCKER_COMPOSE` antes de arrancar:
+
+```bash
+export CINNAMON_DOCKER_COMPOSE="$HOME/proyectos/Cinnamon/docker-compose.yml"
+cinnamon-docker --help   # muestra la ruta efectiva
+```
+
+Debe ser un archivo `docker-compose.yml` válido y Docker Compose v2 debe estar
+instalado (`docker compose version`). No hace falta recompilar. Si la variable
+está vacía o no existe, se usa la ruta por defecto. No hay fallback silencioso a
+otra ruta si apunta a un archivo inexistente.
+
+## No aparece el icono en la bandeja
+
+La app usa StatusNotifierItem (SNI) vía `ksni`. Comprueba que el escritorio
+tiene un watcher:
+
+```bash
+busctl --user list | grep -i StatusNotifierWatcher
+```
+
+- KDE Plasma lo trae activo (`kded6`).
+- GNOME necesita la extensión *AppIndicator and KStatusNotifierItem Support*.
+- Cinnamon moderno usa `xapp-sn-watcher`; en versiones antiguas puede no haber
+  SNI.
+- Si no hay watcher, el log muestra `Bandeja no disponible: …` y cerrar la
+  ventana termina la app (no se queda en segundo plano).
+- Si el icono no está instalado, se usa el pixmap procedural; no es un fallo.
+
+## Cerrar la ventana la oculta y no sé cómo salir
+
+Con bandeja disponible, cerrar la ventana la oculta y mantiene la app y el
+refresco. Para terminar de verdad:
+
+- Pulsa **Salir** en el panel *Actividad* (arriba a la derecha), o
+- abre el menú del icono de la bandeja y elige **Salir**.
+
+Si no hay bandeja, cerrar la ventana termina la app normalmente.
+
+## El tema no cambia o no persiste
+
+El toggle **Claro/Oscuro** está en el header y aplica en caliente. La
+preferencia se guarda en:
 
 ```
-/mnt/disco-local/home/Github/Cinnamon/docker-compose.yml
+~/.config/cinnamon-docker/theme
 ```
 
-Si el proyecto está en otra ruta, *Levantar todo* y las acciones de grupo
-fallan con el error de `docker compose`. Edita la constante en `src/main.rs` y
-recompila:
+Una línea: `light` o `dark`. Respeta `XDG_CONFIG_HOME`. Si el archivo no se
+puede escribir, la app sigue funcionando pero no recuerda el cambio. Revisa
+permisos del directorio y que `HOME`/`XDG_CONFIG_HOME` estén definidos.
+
+## El icono SVG no se ve en el lanzador
+
+`install.sh` copia `assets/icon.svg` a:
+
+```
+~/.local/share/icons/hicolor/scalable/apps/cinnamon-docker.svg
+```
+
+y el `.desktop` usa `Icon=cinnamon-docker`. Si el lanzador sigue mostrando un
+icono genérico:
+
+```bash
+gtk-update-icon-cache -q -t ~/.local/share/icons/hicolor
+update-desktop-database -q ~/.local/share/applications
+```
+
+Cierra y vuelve a abrir el menú de aplicaciones. En KDE puede tardar un
+refresco de caché. El icono de la bandeja tiene fallback propio y no depende de
+este archivo.
+
+## `install.sh` dice que falta el binario
+
+Compila primero:
 
 ```bash
 cargo build --release -j 2
-install -Dm755 target/release/cinnamon-docker ~/.local/bin/cinnamon-docker
+./install.sh
 ```
 
-No hay variable de entorno ni archivo de configuración en runtime.
+El script no compila por ti. Instala en `~/.local` por defecto; usa
+`PREFIX=/otra/ruta ./install.sh` si quieres otro prefijo (sin root).
 
 ## Wayland: ventana vacía o error de EGL/GL
 

@@ -1,117 +1,152 @@
-# cinnamon-docker
+# Docker Cinnamon
 
-Panel de escritorio Linux para el motor Docker, el stack compose de Cinnamon y
-todos los contenedores del daemon, sin terminal.
+<p align="center"><img src="assets/icon.svg" width="112" alt="Icono de Docker Cinnamon"></p>
+
+Panel nativo Linux en Rust/egui para el motor Docker, el stack compose de
+Cinnamon y **cualquier** contenedor o proyecto del daemon, sin terminal.
 
 [![CI](https://github.com/Canopus44/cinnamon-docker/actions/workflows/ci.yml/badge.svg)](https://github.com/Canopus44/cinnamon-docker/actions/workflows/ci.yml)
 [![Licencia: MIT](https://img.shields.io/badge/license-MIT-46C2A3.svg)](LICENSE)
 
-![Captura de cinnamon-docker](docs/screenshot.png)
-
-## Qué es
-
-Una app nativa en Rust (`egui`/`eframe`, renderer `glow`, X11) que muestra el
-estado del motor y de cada contenedor, permite arrancar/parar servicios en
-orden y sigue el consumo de CPU/RAM. Un solo binario, sin tokio ni async, sin
-daemon propio ni configuración en runtime.
+| Tema claro | Tema oscuro |
+|---|---|
+| ![Captura clara](docs/screenshot.png) | ![Captura oscura](docs/screenshot-dark.png) |
 
 ## Características
 
 - **Motor Docker**: Iniciar/Detener vía
-  `pkexec /usr/bin/systemctl {start|stop} docker.socket docker`. Detener pide
+  `pkexec /usr/bin/systemctl start/stop docker.socket docker`. Detener pide
   confirmación porque apaga **todos** los contenedores de **todos** los
-  proyectos. Si no hay `pkexec`, intenta `systemctl` directo.
-- **Stack Cinnamon**: 8 servicios fijos (chat-postgres, erp-postgres, mongo,
-  pgadmin, chat-backend, chat-frontend, erp-backend, erp-frontend).
-  *Levantar todo (serie)* hace `docker compose up -d` servicio a servicio y
-  espera `healthy` (timeout 900 s): dos `ng serve` en paralelo agotan la RAM y
-  mueren con exit 137.
-- **Todos los contenedores del daemon**, agrupados por proyecto compose: Cinnamon
-  primero, el resto alfabético y `Sin proyecto` al final. Estado y salud como
-  pills; acciones Iniciar/Detener/Reiniciar/Logs por contenedor y por grupo.
-- **CPU/RAM** por contenedor (con barras) y totales en el header, más `n/8`
-  servicios arriba de Cinnamon.
-- **Log lateral** redimensionable, con Copiar, Limpiar y auto-scroll.
+  proyectos.
+- **Selector de proyecto en el header**: `Levantar <proyecto>` /
+  `Apagar <proyecto>` para **cualquier** proyecto compose o contenedores
+  sueltos (`Sin proyecto`). Cinnamon conserva el arranque en serie con espera
+  `healthy` (timeout 900 s: dos `ng serve` en paralelo agotan la RAM y mueren
+  con exit 137); el resto de proyectos usan `docker start` secuencial.
+- **Tarjetas por contenedor** con estado y salud, imagen, uptime, CPU/RAM y
+  acciones Iniciar/Detener/Reiniciar/Logs.
+- **Resumen arriba**: CPU total, RAM total y contenedores; métricas cada 5 s
+  (`docker stats --no-stream`).
+- **Bandeja SNI**: Abrir panel, Iniciar/Detener motor, Refrescar,
+  Levantar/Apagar proyecto seleccionado, Salir. Cerrar la ventana la oculta en
+  la bandeja; si no hay bandeja disponible, la ventana cierra con normalidad.
+- **Tema claro/oscuro estilo iOS 26** con selector en el header; la
+  preferencia queda persistida.
+- **Panel de actividad lateral redimensionable** con Copiar, Limpiar y
+  auto-scroll.
 - **CLI** para scripts: `--status`, `--containers`, `--help`.
-- Tema oscuro, sin dependencias de red y sin telemetría.
-- **No borra contenedores ni volúmenes.**
+- **No borra contenedores ni volúmenes**, sin telemetría, un solo binario.
 
 ## Requisitos
 
 - Linux con X11 o Wayland (la app corre por XWayland).
-- Docker en marcha o instalado como servicio systemd; usuario en el grupo
-  `docker` para el CLI.
-- `polkit`/`pkexec` para el botón de motor (sin él, `systemctl` directo).
+- Docker Engine + plugin Compose v2.
+- `polkit`/`pkexec` para el botón de motor.
 - Rust stable para compilar.
+- Usuario en el grupo `docker` para CLI y métricas.
 
 Dependencias de build:
 
 ```bash
 # Arch
-sudo pacman -S --needed base-devel pkgconf libxkbcommon libx11 libxi \
-  libxcursor libxrandr mesa fontconfig
+sudo pacman -S --needed base-devel rust docker docker-compose polkit \
+  libxkbcommon libx11 libxi libxcursor libxrandr mesa fontconfig
 
 # Debian / Ubuntu
 sudo apt install build-essential pkg-config libxkbcommon-dev libx11-dev \
-  libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
+  libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev \
+  docker.io docker-compose-v2 policykit-1
 ```
 
-## Compilar e instalar
+> Nota: si tu distro no trae `docker compose` v2, instala el plugin oficial de
+> Docker; la app ejecuta `docker compose`, no `docker-compose`.
+
+## Instalación rápida
 
 ```bash
+git clone https://github.com/Canopus44/cinnamon-docker.git
+cd cinnamon-docker
 cargo build --release -j 2
-install -Dm755 target/release/cinnamon-docker ~/.local/bin/cinnamon-docker
+./install.sh
 ```
 
-Lanzador de escritorio (`~/.local/share/applications/cinnamon-docker.desktop`):
+`install.sh` copia a `~/.local` el binario, `icon.svg`, `icon-symbolic.svg` y
+un `.desktop` con `Exec` absoluto, y refresca los caches de iconos y escritorio
+si existen. No necesita root. Respeta `PREFIX`:
 
-```ini
-[Desktop Entry]
-Type=Application
-Name=Docker Cinnamon
-Comment=Panel del motor Docker y del stack Cinnamon
-Exec=%h/.local/bin/cinnamon-docker
-Icon=docker
-Terminal=false
-Categories=Development;System;
+```bash
+sudo env PREFIX=/usr/local ./install.sh   # instalación en sistema
 ```
+
+Asegura que `~/.local/bin` esté en el `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Paso a paso, desinstalación y autostart en
+[docs/install.md](docs/install.md).
 
 ## Uso
 
-GUI: abre la ventana, mira el header (motor, socket, versión, totales) y las
-tarjetas. *Levantar todo (serie)* arranca el stack; *Apagar todo (cinnamon)* lo
-para; cada tarjeta tiene sus propias acciones.
+**GUI**: ejecuta `cinnamon-docker`, elige el proyecto en el header,
+levántalo o apágalo con los botones y usa las acciones de cada tarjeta
+(Iniciar/Detener/Reiniciar/Logs).
 
-CLI (sale con 0):
+**Bandeja**: el clic izquierdo sobre el icono abre el panel; el menú ofrece
+Abrir panel, Iniciar/Detener motor, Refrescar, Levantar/Apagar proyecto
+seleccionado y Salir. «Salir» termina el proceso; cerrar la ventana sólo la
+oculta.
+
+**CLI** (sale con 0):
 
 | Comando | Salida |
 |---|---|
 | `cinnamon-docker` | Ventana. |
 | `cinnamon-docker --status` | Motor, socket, versión y tabla de los 8 servicios Cinnamon (estado, salud, detalle). |
 | `cinnamon-docker --containers` | Todos los contenedores con proyecto, nombre, estado, salud, imagen y detalle. |
-| `cinnamon-docker --help` | Ayuda y ruta del compose. |
+| `cinnamon-docker --help` | Ayuda y ruta efectiva del compose. |
 
-Con el motor apagado la CLI no consulta el daemon (el socket lo reactivaría):
-muestra el estado del motor y los servicios como `detenido`.
+Con el motor apagado la CLI no consulta el daemon (el socket lo
+reactivaría): muestra el estado del motor y los servicios como `detenido`.
 
 ## Configuración
 
-No hay archivo de configuración: son constantes de `src/main.rs`.
+### Compose de Cinnamon
 
-| Constante | Valor por defecto | Para qué |
+`CINNAMON_DOCKER_COMPOSE` define la ruta del compose del stack Cinnamon. Si no
+se define, se usa la ruta por defecto del autor:
+
+```bash
+export CINNAMON_DOCKER_COMPOSE="$HOME/proyectos/Cinnamon/docker-compose.yml"
+```
+
+Se lee al arrancar; `cinnamon-docker --help` muestra la ruta efectiva.
+
+### Tema
+
+El selector del header guarda la preferencia en
+`~/.config/cinnamon-docker/theme` (`light` o `dark`). `XDG_CONFIG_HOME` se
+respeta.
+
+### Constantes
+
+| Constante | Valor | Para qué |
 |---|---|---|
-| `COMPOSE_FILE` | `/mnt/disco-local/home/Github/Cinnamon/docker-compose.yml` | Compose del stack Cinnamon. **Ruta del autor**: edítala y recompila para otro proyecto. |
-| `SERVICES` | los 8 servicios Cinnamon | Orden de arranque serie y columna del CLI. |
+| `SERVICES` | los 8 servicios Cinnamon | Orden de arranque en serie y columna del CLI. |
 | `REFRESH_EVERY` | 2 s | `docker ps -a` y estado del motor. |
 | `STATS_EVERY` | 5 s | `docker stats --no-stream`. |
 | `WAIT_TIMEOUT` | 900 s | Espera de `healthy` por servicio. |
 
+El resto de comportamiento se edita en `src/main.rs`: no hay más configuración
+en runtime.
+
 ## Cómo funciona
 
-UI en el hilo principal, refresco y stats en hilos propios, un hilo por acción,
-comunicados por `mpsc`. Con el motor apagado no se toca el daemon y al detener
-se para antes `docker.socket`. Detalles, invariantes y puntos de extensión en
-[docs/architecture.md](docs/architecture.md). Problemas típicos en
+La UI corre en el hilo principal con `eframe`/`egui` 0.37 (renderer `glow`);
+el refresco, las métricas y las acciones corren en hilos propios comunicados
+por `mpsc`; la bandeja usa `ksni`. Detalles, invariantes y puntos de extensión
+en [docs/architecture.md](docs/architecture.md). Problemas típicos en
 [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Limitaciones y seguridad
@@ -120,12 +155,12 @@ se para antes `docker.socket`. Detalles, invariantes y puntos de extensión en
   `compose up -d`. No hay `rm`, `down -v` ni borrado de volúmenes.
 - **Detener el motor apaga todos los contenedores** de todos los proyectos;
   por eso hay modal de confirmación.
-- **La ruta del compose está fija** y es la del autor. Cambiarla exige editar y
-  recompilar.
 - **Sin daemon remoto**: sólo el Docker local (`DOCKER_HOST` no se usa).
-- **`pkexec`** pide autenticación en cada arranque/parada del motor; el
-  resultado y el comando exacto se muestran en el banner y el log.
+- **`pkexec`** pide autenticación en cada arranque/parada del motor.
 - Requiere sesión gráfica X11 o XWayland; no hay modo headless (usa la CLI).
+- La ruta del compose es configurable por variable de entorno, pero el stack
+  Cinnamon sigue teniendo sus 8 servicios en `SERVICES`: para otro stack con
+  arranque en serie hay que editar `src/main.rs` y recompilar.
 
 ## Contribuir
 
