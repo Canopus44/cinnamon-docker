@@ -87,6 +87,25 @@ export PATH="$HOME/.local/bin:$PATH"
 Paso a paso, desinstalación y autostart en
 [docs/install.md](docs/install.md).
 
+## Paquete y releases
+
+Los releases están en
+[github.com/Canopus44/cinnamon-docker/releases](https://github.com/Canopus44/cinnamon-docker/releases).
+El paquete portable `cinnamon-docker-<versión>-x86_64-linux.tar.gz` incluye el
+binario, los iconos SVG, el `.desktop`, `install.sh`, el README y la licencia.
+
+```bash
+tar xzf cinnamon-docker-0.2.0-x86_64-linux.tar.gz
+cd cinnamon-docker-0.2.0-x86_64-linux
+./install.sh
+```
+
+Verifica el checksum desde el directorio que contiene ambos archivos:
+
+```bash
+sha256sum -c cinnamon-docker-0.2.0-x86_64-linux.tar.gz.sha256
+```
+
 ## Uso
 
 **GUI**: ejecuta `cinnamon-docker`, elige el proyecto en el header,

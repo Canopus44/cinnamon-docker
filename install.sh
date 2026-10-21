@@ -4,9 +4,11 @@ set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 prefix="${PREFIX:-$HOME/.local}"
-bin="$root/target/release/cinnamon-docker"
-
-if [[ ! -f "$bin" ]]; then
+if [[ -x "$root/target/release/cinnamon-docker" ]]; then
+    bin="$root/target/release/cinnamon-docker"
+elif [[ -x "$root/cinnamon-docker" ]]; then
+    bin="$root/cinnamon-docker"
+else
     echo "Compila primero: cargo build --release -j 2" >&2
     exit 1
 fi
