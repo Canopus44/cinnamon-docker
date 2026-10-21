@@ -4,10 +4,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,25 @@ const SERVICES: [&str; 8] = [
 ];
 
 const CINNAMON_PROJECT: &str = "cinnamon";
-const COMPOSE_FILE: &str = "/mnt/disco-local/home/Github/Cinnamon/docker-compose.yml";
+const DEFAULT_COMPOSE_FILE: &str = "/mnt/disco-local/home/Github/Cinnamon/docker-compose.yml";
+
+/// Valor no vacío de `CINNAMON_DOCKER_COMPOSE`, o la ruta por defecto.
+fn resolve_compose_file(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_COMPOSE_FILE)
+        .to_string()
+}
+
+fn compose_file() -> &'static str {
+    static FILE: OnceLock<String> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let env = std::env::var("CINNAMON_DOCKER_COMPOSE").ok();
+        resolve_compose_file(env.as_deref())
+    })
+}
+
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 /// `docker stats --no-stream` tarda ~2 s: cadencia propia y en su hilo.
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -40,90 +59,307 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 
 // ── tema ───────────────────────────────────────────────────────────────────
 
-const BG: egui::Color32 = egui::Color32::from_rgb(0x0E, 0x13, 0x16);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(0x15, 0x1C, 0x20);
-const CARD: egui::Color32 = egui::Color32::from_rgb(0x1A, 0x23, 0x28);
-const HOVER: egui::Color32 = egui::Color32::from_rgb(0x20, 0x2B, 0x31);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(0x26, 0x34, 0x3B);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(0xE6, 0xED, 0xF0);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x9C, 0xA5);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x46, 0xC2, 0xA3);
-const INFO: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x9D, 0xFF);
-const OK: egui::Color32 = egui::Color32::from_rgb(0x3D, 0xD6, 0x8C);
-const WARN: egui::Color32 = egui::Color32::from_rgb(0xE3, 0xB3, 0x41);
-const ERR: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x6D, 0x6D);
+/// Modo de color conmutable en caliente; se persiste en `theme`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ThemeMode {
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Claro",
+            Self::Dark => "Oscuro",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "light" | "claro" => Some(Self::Light),
+            "dark" | "oscuro" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    fn egui_theme(self) -> egui::Theme {
+        match self {
+            Self::Light => egui::Theme::Light,
+            Self::Dark => egui::Theme::Dark,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: egui::Color32,
+    surface: egui::Color32,
+    card: egui::Color32,
+    hover: egui::Color32,
+    border: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    accent: egui::Color32,
+    on_accent: egui::Color32,
+    info: egui::Color32,
+    ok: egui::Color32,
+    warn: egui::Color32,
+    err: egui::Color32,
+    shadow: egui::Color32,
+    /// Sombra suave de tarjetas: más marcada en oscuro, donde el borde solo no
+    /// separa la superficie del fondo.
+    card_shadow: egui::Color32,
+    gradient_top: egui::Color32,
+    gradient_bottom: egui::Color32,
+}
+
+const LIGHT_PALETTE: Palette = Palette {
+    bg: egui::Color32::from_rgb(0xF2, 0xF2, 0xF7),
+    surface: egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 236),
+    card: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    hover: egui::Color32::from_rgb(0xE8, 0xE8, 0xED),
+    border: egui::Color32::from_rgb(0xD1, 0xD1, 0xD6),
+    text: egui::Color32::from_rgb(0x1C, 0x1C, 0x1E),
+    muted: egui::Color32::from_rgb(0x6C, 0x6C, 0x70),
+    accent: egui::Color32::from_rgb(0x0A, 0x7C, 0x6B),
+    on_accent: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    info: egui::Color32::from_rgb(0x00, 0x66, 0xCC),
+    ok: egui::Color32::from_rgb(0x24, 0x8A, 0x3D),
+    warn: egui::Color32::from_rgb(0xB2, 0x50, 0x00),
+    err: egui::Color32::from_rgb(0xD7, 0x00, 0x15),
+    shadow: egui::Color32::from_rgba_unmultiplied_const(0, 0, 0, 26),
+    card_shadow: egui::Color32::from_rgba_unmultiplied_const(0, 0, 0, 18),
+    gradient_top: egui::Color32::from_rgb(0xEA, 0xF7, 0xF4),
+    gradient_bottom: egui::Color32::from_rgb(0xF2, 0xF2, 0xF7),
+};
+
+const DARK_PALETTE: Palette = Palette {
+    bg: egui::Color32::from_rgb(0x0B, 0x0F, 0x12),
+    surface: egui::Color32::from_rgba_unmultiplied_const(21, 27, 31, 242),
+    card: egui::Color32::from_rgb(0x1C, 0x24, 0x29),
+    hover: egui::Color32::from_rgb(0x23, 0x2D, 0x33),
+    border: egui::Color32::from_rgb(0x2C, 0x36, 0x3C),
+    text: egui::Color32::from_rgb(0xF5, 0xF7, 0xFA),
+    muted: egui::Color32::from_rgb(0x9A, 0xA6, 0xAD),
+    accent: egui::Color32::from_rgb(0x2D, 0xD4, 0xBF),
+    on_accent: egui::Color32::from_rgb(0x06, 0x23, 0x1F),
+    info: egui::Color32::from_rgb(0x64, 0xD2, 0xFF),
+    ok: egui::Color32::from_rgb(0x30, 0xD1, 0x58),
+    warn: egui::Color32::from_rgb(0xFF, 0xD6, 0x0A),
+    err: egui::Color32::from_rgb(0xFF, 0x45, 0x3A),
+    shadow: egui::Color32::from_rgba_unmultiplied_const(0, 0, 0, 160),
+    card_shadow: egui::Color32::from_rgba_unmultiplied_const(0, 0, 0, 60),
+    gradient_top: egui::Color32::from_rgb(0x0E, 0x1A, 0x1C),
+    gradient_bottom: egui::Color32::from_rgb(0x0B, 0x0F, 0x12),
+};
+
+/// Colores de marca: el mismo degradado y motivos del icono instalado, sin
+/// depender del tema.
+const ICON_TOP: egui::Color32 = egui::Color32::from_rgb(0x2D, 0xD4, 0xBF);
+const ICON_BOTTOM: egui::Color32 = egui::Color32::from_rgb(0x0A, 0x7C, 0x6B);
+const ICON_INK: egui::Color32 = egui::Color32::from_rgb(0x06, 0x4E, 0x46);
+const ICON_ORANGE: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x8A, 0x4A);
+
+/// La UI se dibuja entera en el hilo principal; el atómico solo evita pasar la
+/// paleta por cada función de dibujo. No hay otro hilo leyéndolo.
+static CURRENT_MODE: AtomicU8 = AtomicU8::new(0);
+
+fn palette_for(mode: ThemeMode) -> &'static Palette {
+    match mode {
+        ThemeMode::Light => &LIGHT_PALETTE,
+        ThemeMode::Dark => &DARK_PALETTE,
+    }
+}
+
+fn current_mode() -> ThemeMode {
+    if CURRENT_MODE.load(Ordering::Relaxed) == 1 {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    }
+}
+
+fn set_current_mode(mode: ThemeMode) {
+    let v = match mode {
+        ThemeMode::Light => 0,
+        ThemeMode::Dark => 1,
+    };
+    CURRENT_MODE.store(v, Ordering::Relaxed);
+}
+
+fn pal() -> &'static Palette {
+    palette_for(current_mode())
+}
+
+fn theme_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("cinnamon-docker").join("theme"))
+}
+
+/// Preferencia guardada; cualquier error cae en el tema claro.
+fn load_theme() -> ThemeMode {
+    theme_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| ThemeMode::parse(&s))
+        .unwrap_or(ThemeMode::Light)
+}
+
+/// Guarda la preferencia sin ruido: si falla, la app sigue con el tema actual.
+fn save_theme(mode: ThemeMode) {
+    let Some(path) = theme_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, mode.key());
+}
 
 /// Mismo color con otra opacidad: fondos de pills y avisos.
 fn tint(c: egui::Color32, alpha: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
 
-fn apply_theme(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = BG;
-    v.window_fill = SURFACE;
-    v.faint_bg_color = CARD;
-    v.extreme_bg_color = BG;
-    v.code_bg_color = CARD;
-    v.override_text_color = Some(TEXT);
-    v.weak_text_color = Some(MUTED);
-    v.selection.bg_fill = tint(ACCENT, 90);
-    v.selection.stroke = egui::Stroke::new(1.0, TEXT);
-    v.hyperlink_color = INFO;
-    v.warn_fg_color = WARN;
-    v.error_fg_color = ERR;
-    v.window_corner_radius = egui::CornerRadius::same(12);
-    v.window_stroke = egui::Stroke::new(1.0, BORDER);
+fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
+    let p = palette_for(mode);
+    let mut v = match mode {
+        ThemeMode::Light => egui::Visuals::light(),
+        ThemeMode::Dark => egui::Visuals::dark(),
+    };
+    // El gradiente de `paint_window_background` se pinta detrás.
+    v.panel_fill = egui::Color32::TRANSPARENT;
+    v.window_fill = p.surface;
+    v.faint_bg_color = p.card;
+    v.extreme_bg_color = p.bg;
+    v.code_bg_color = p.card;
+    v.override_text_color = Some(p.text);
+    v.weak_text_color = Some(p.muted);
+    v.selection.bg_fill = tint(p.accent, 70);
+    v.selection.stroke = egui::Stroke::new(1.0, p.accent);
+    v.hyperlink_color = p.info;
+    v.warn_fg_color = p.warn;
+    v.error_fg_color = p.err;
+    v.window_corner_radius = egui::CornerRadius::same(20);
+    v.window_stroke = egui::Stroke::new(1.0, p.border);
     v.window_shadow = egui::Shadow {
-        offset: [0, 8],
-        blur: 24,
+        offset: [0, 10],
+        blur: 30,
         spread: 0,
-        color: egui::Color32::from_black_alpha(160),
+        color: p.shadow,
     };
     v.popup_shadow = egui::Shadow {
-        offset: [0, 4],
-        blur: 12,
+        offset: [0, 6],
+        blur: 18,
         spread: 0,
-        color: egui::Color32::from_black_alpha(120),
+        color: p.shadow,
     };
 
-    // Botones con radio 8; marcos y contenedores no interactivos con radio 10.
-    let button_radius = egui::CornerRadius::same(8);
-    let frame_radius = egui::CornerRadius::same(10);
-    let border = egui::Stroke::new(1.0, BORDER);
+    // Botones con radio 12; marcos y contenedores no interactivos con radio 16.
+    let button_radius = egui::CornerRadius::same(12);
+    let frame_radius = egui::CornerRadius::same(16);
+    let border = egui::Stroke::new(1.0, p.border);
 
-    v.widgets.noninteractive.bg_fill = SURFACE;
-    v.widgets.noninteractive.weak_bg_fill = SURFACE;
+    v.widgets.noninteractive.bg_fill = p.surface;
+    v.widgets.noninteractive.weak_bg_fill = p.surface;
     v.widgets.noninteractive.bg_stroke = border;
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, p.text);
     v.widgets.noninteractive.corner_radius = frame_radius;
 
-    v.widgets.inactive.bg_fill = CARD;
-    v.widgets.inactive.weak_bg_fill = CARD;
+    v.widgets.inactive.bg_fill = p.card;
+    v.widgets.inactive.weak_bg_fill = p.card;
     v.widgets.inactive.bg_stroke = border;
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.text);
     v.widgets.inactive.corner_radius = button_radius;
 
-    v.widgets.hovered.bg_fill = HOVER;
-    v.widgets.hovered.weak_bg_fill = HOVER;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
+    v.widgets.hovered.bg_fill = p.hover;
+    v.widgets.hovered.weak_bg_fill = p.hover;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, p.accent);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.text);
     v.widgets.hovered.corner_radius = button_radius;
 
-    v.widgets.active.bg_fill = HOVER;
-    v.widgets.active.weak_bg_fill = HOVER;
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, ACCENT);
+    v.widgets.active.bg_fill = p.hover;
+    v.widgets.active.weak_bg_fill = p.hover;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, p.accent);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, p.accent);
     v.widgets.active.corner_radius = button_radius;
 
     v.widgets.open = v.widgets.active;
 
-    ctx.set_theme(egui::Theme::Dark);
+    ctx.set_theme(mode.egui_theme());
     ctx.set_visuals(v);
-    ctx.style_mut_of(egui::Theme::Dark, |style| {
+    ctx.style_mut_of(mode.egui_theme(), |style| {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.button_padding = egui::vec2(14.0, 7.0);
+        style.spacing.interact_size.y = 32.0;
+        style.text_styles = [
+            (egui::TextStyle::Heading, egui::FontId::proportional(24.0)),
+            (egui::TextStyle::Body, egui::FontId::proportional(13.5)),
+            (egui::TextStyle::Button, egui::FontId::proportional(13.0)),
+            (egui::TextStyle::Small, egui::FontId::proportional(11.0)),
+            (egui::TextStyle::Monospace, egui::FontId::monospace(12.0)),
+        ]
+        .into_iter()
+        .collect();
     });
+}
+
+/// Gradiente vertical de dos colores en la capa de fondo.
+fn paint_window_background(ctx: &egui::Context) {
+    let p = pal();
+    let rect = ctx.content_rect();
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), p.gradient_top);
+    mesh.colored_vertex(rect.right_top(), p.gradient_top);
+    mesh.colored_vertex(rect.left_bottom(), p.gradient_bottom);
+    mesh.colored_vertex(rect.right_bottom(), p.gradient_bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    ctx.layer_painter(egui::LayerId::background())
+        .add(egui::Shape::mesh(mesh));
+}
+
+/// Control segmentado Claro/Oscuro; devuelve el modo nuevo solo si cambia.
+fn theme_switch(ui: &mut egui::Ui, current: ThemeMode) -> Option<ThemeMode> {
+    let mut chosen = None;
+    egui::Frame::new()
+        .fill(tint(pal().muted, 18))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::same(2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
+                for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                    let selected = mode == current;
+                    let button = egui::Button::new(
+                        egui::RichText::new(mode.label())
+                            .size(11.0)
+                            .color(if selected { pal().text } else { pal().muted }),
+                    )
+                    .fill(if selected {
+                        pal().card
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(8);
+                    if ui.add(button).clicked() && !selected {
+                        chosen = Some(mode);
+                    }
+                }
+            });
+        });
+    chosen
 }
 
 /// Ancho real de un texto sin envolver: evita huecos y cortes innecesarios.
@@ -134,7 +370,7 @@ fn text_width(ui: &egui::Ui, text: &str, size: f32, mono: bool) -> f32 {
         egui::FontId::proportional(size)
     };
     ui.painter()
-        .layout_no_wrap(text.to_owned(), font, TEXT)
+        .layout_no_wrap(text.to_owned(), font, pal().text)
         .size()
         .x
 }
@@ -170,11 +406,11 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
-/// Barra de 44×4: fondo `BORDER` y relleno proporcional al color semántico.
+/// Barra de 44×4: fondo del borde del tema y relleno proporcional al color semántico.
 fn meter(ui: &mut egui::Ui, frac: f32, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 4.0), egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 2, BORDER);
+    painter.rect_filled(rect, 2, pal().border);
     let filled = rect.width() * frac.clamp(0.0, 1.0);
     if filled > 0.0 {
         let bar = egui::Rect::from_min_size(rect.min, egui::vec2(filled, rect.height()));
@@ -201,18 +437,18 @@ fn stat_text(
             .color(color),
     )
     .on_hover_text("Fuente: docker stats --no-stream");
-    ui.label(egui::RichText::new(label).size(10.0).color(MUTED));
+    ui.label(egui::RichText::new(label).size(10.0).color(pal().muted));
 }
 
-/// Pill compacta: texto corto sobre el color semántico atenuado.
+/// Pill compacta: texto corto sobre el color semántico atenuado. Radio 255 =
+/// extremo redondeado (CornerRadius es u8).
 fn pill(ui: &mut egui::Ui, text: impl Into<String>, fg: egui::Color32) -> egui::Response {
     egui::Frame::new()
-        .fill(tint(fg, 28))
-        .stroke(egui::Stroke::new(1.0, tint(fg, 70)))
-        .corner_radius(10)
-        .inner_margin(egui::Margin::symmetric(8, 3))
+        .fill(tint(fg, 22))
+        .corner_radius(255)
+        .inner_margin(egui::Margin::symmetric(10, 4))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text.into()).size(12.0).color(fg))
+            ui.label(egui::RichText::new(text.into()).size(11.5).color(fg))
         })
         .inner
 }
@@ -220,18 +456,93 @@ fn pill(ui: &mut egui::Ui, text: impl Into<String>, fg: egui::Color32) -> egui::
 /// Pill con punto pintado (la fuente por defecto no trae `●`).
 fn dot_pill(ui: &mut egui::Ui, color: egui::Color32, text: &str) -> egui::Response {
     egui::Frame::new()
-        .fill(tint(color, 28))
-        .stroke(egui::Stroke::new(1.0, tint(color, 70)))
-        .corner_radius(10)
-        .inner_margin(egui::Margin::symmetric(8, 3))
+        .fill(tint(color, 22))
+        .corner_radius(255)
+        .inner_margin(egui::Margin::symmetric(10, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 status_dot(ui, color);
-                ui.label(egui::RichText::new(text).size(12.0).color(color));
+                ui.label(egui::RichText::new(text).size(11.5).color(color));
             });
         })
         .response
+}
+
+/// Botón suave: fondo tintado, sin borde y radio completo. El padding se fija
+/// en un scope para no alterar el resto de la fila.
+fn soft_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    color: egui::Color32,
+    enabled: bool,
+) -> egui::Response {
+    let text =
+        egui::RichText::new(label)
+            .size(11.5)
+            .color(if enabled { color } else { pal().muted });
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(9.0, 4.0);
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(text)
+                .fill(tint(color, if enabled { 18 } else { 8 }))
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(255)
+                .min_size(egui::vec2(0.0, 26.0)),
+        )
+    })
+    .inner
+}
+
+/// Marca de la app: los mismos píxeles que el icono de bandeja y de ventana.
+fn brand_mark(ui: &mut egui::Ui, size: f32) {
+    static RGBA: LazyLock<Vec<u8>> = LazyLock::new(|| brand_rgba(128));
+    let tex = ui.ctx().load_texture_cached(
+        "brand-mark",
+        egui::Id::unique("brand-mark"),
+        egui::ColorImage::from_rgba_unmultiplied([128, 128], &RGBA),
+        egui::TextureOptions::LINEAR,
+    );
+    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+        tex.id(),
+        egui::vec2(size, size),
+    )))
+    .on_hover_text("Docker Cinnamon");
+}
+
+/// Tarjeta de resumen: etiqueta, valor grande y detalle. Ocupa el ancho de su
+/// columna; el valor baja a 22 px cuando la columna es estrecha.
+fn summary_card(ui: &mut egui::Ui, label: &str, value: &str, detail: &str) {
+    let value_size = if ui.available_width() < 170.0 {
+        22.0
+    } else {
+        26.0
+    };
+    egui::Frame::new()
+        .fill(pal().card)
+        .corner_radius(20)
+        .inner_margin(egui::Margin::same(16))
+        .stroke(egui::Stroke::new(1.0, pal().border))
+        .shadow(egui::Shadow {
+            offset: [0, 2],
+            blur: 12,
+            spread: 0,
+            color: pal().card_shadow,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(label).size(11.0).color(pal().muted));
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(value)
+                    .size(value_size)
+                    .strong()
+                    .color(pal().text),
+            );
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(detail).size(11.0).color(pal().muted));
+        });
 }
 
 // ── ejecución de comandos ───────────────────────────────────────────────────
@@ -357,7 +668,7 @@ fn pkexec_bin() -> Option<&'static str> {
 }
 
 fn compose(args: &[&str]) -> CmdOut {
-    let mut full = vec!["compose", "-f", COMPOSE_FILE];
+    let mut full = vec!["compose", "-f", compose_file(), "-p", CINNAMON_PROJECT];
     full.extend_from_slice(args);
     run(docker_bin(), &full)
 }
@@ -625,9 +936,25 @@ fn human_bytes(b: u64) -> String {
 
 fn find_service<'a>(rows: &'a [Container], svc: &str) -> Option<&'a Container> {
     rows.iter().find(|c| {
-        (c.project == CINNAMON_PROJECT || c.project.is_empty())
+        c.project == CINNAMON_PROJECT
             && (c.service == svc || (c.service.is_empty() && c.name == svc))
     })
+}
+
+/// ¿Queda algo por arrancar en este proyecto? Cinnamon cuenta sus 8 servicios
+/// por nombre, no por número de contenedores: un duplicado/huérfano no debe
+/// deshabilitar el arranque si falta un servicio real.
+fn can_start_project(project: &str, items: &[Container]) -> bool {
+    if project == CINNAMON_PROJECT {
+        SERVICES.iter().any(|svc| {
+            items
+                .iter()
+                .find(|c| c.service == *svc || c.name == *svc)
+                .is_none_or(|c| !c.is_up())
+        })
+    } else {
+        items.iter().any(|c| !c.is_up())
+    }
 }
 
 fn services_from(rows: &[Container]) -> Vec<(String, SvcState)> {
@@ -669,6 +996,18 @@ fn group_key(project: &str) -> String {
     }
 }
 
+/// Orden de proyectos: cinnamon primero, resto alfabético y «Sin proyecto» al
+/// final.
+fn project_rank(project: &str) -> String {
+    if project == CINNAMON_PROJECT {
+        format!("0{project}")
+    } else if project.is_empty() {
+        format!("2{project}")
+    } else {
+        format!("1{project}")
+    }
+}
+
 // ── mensajes del hilo de trabajo ───────────────────────────────────────────
 
 #[derive(Clone)]
@@ -695,6 +1034,7 @@ enum Msg {
     },
     Notice(Option<Notice>),
     ForceRefresh,
+    Tray(TrayAction),
     Stats {
         rows: HashMap<String, Stats>,
         error: Option<String>,
@@ -1106,8 +1446,8 @@ fn group_stop(tx: Sender<Msg>, project: String, items: Vec<Container>) {
     });
 }
 
-fn start_all(tx: Sender<Msg>, items: Vec<Container>) {
-    group_start(tx, CINNAMON_PROJECT.to_string(), items)
+fn start_all(tx: Sender<Msg>) {
+    group_start(tx, CINNAMON_PROJECT.to_string(), Vec::new())
 }
 
 fn stop_all(tx: Sender<Msg>) {
@@ -1127,11 +1467,351 @@ fn stop_all(tx: Sender<Msg>) {
     });
 }
 
+// ── bandeja ────────────────────────────────────────────────────────────────
+
+use ksni::blocking::TrayMethods;
+use ksni::menu::StandardItem;
+
+#[derive(Clone, PartialEq, Eq)]
+enum TrayAction {
+    Show,
+    EngineStart,
+    EngineStop,
+    Refresh,
+    StartProject(String),
+    StopProject(String),
+    Quit,
+}
+
+#[derive(Clone, PartialEq, Default)]
+struct TrayState {
+    engine_active: Option<bool>,
+    socket_active: Option<bool>,
+    busy: bool,
+    selected_project: String,
+    selected_running: usize,
+    selected_stopped: usize,
+    selected_can_start: bool,
+}
+
+struct CinnamonTray {
+    tx: Sender<Msg>,
+    state: Arc<Mutex<TrayState>>,
+    ctx: Option<egui::Context>,
+}
+
+impl CinnamonTray {
+    fn send(&self, action: TrayAction) {
+        let _ = self.tx.send(Msg::Tray(action));
+    }
+
+    fn wake(&self) {
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+
+    fn show(&self) {
+        if let Some(ctx) = &self.ctx {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        self.wake();
+    }
+
+    fn snapshot(&self) -> TrayState {
+        self.state.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+}
+
+impl ksni::Tray for CinnamonTray {
+    fn id(&self) -> String {
+        "cinnamon-docker".to_string()
+    }
+
+    fn title(&self) -> String {
+        let s = self.snapshot();
+        let total = s.selected_running + s.selected_stopped;
+        let mut title = format!("Docker Cinnamon · {}/{total} arriba", s.selected_running);
+        match s.engine_active {
+            Some(true) => title.push_str(" · motor activo"),
+            Some(false) => title.push_str(" · motor detenido"),
+            None => {}
+        }
+        title
+    }
+
+    fn icon_name(&self) -> String {
+        installed_icon_name()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![tray_icon()]
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        let s = self.snapshot();
+        let engine = match s.engine_active {
+            Some(true) => "motor activo",
+            Some(false) => "motor detenido",
+            None => "motor —",
+        };
+        ksni::ToolTip {
+            title: self.title(),
+            description: format!(
+                "Proyecto: {} · {}/{} arriba · {engine}",
+                group_key(&s.selected_project),
+                s.selected_running,
+                s.selected_running + s.selected_stopped
+            ),
+            icon_pixmap: vec![tray_icon()],
+            ..Default::default()
+        }
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.show();
+        self.send(TrayAction::Show);
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        let s = self.snapshot();
+        let project = group_key(&s.selected_project);
+        let item = |label: String, icon: &str, enabled: bool, action: TrayAction| {
+            StandardItem {
+                label,
+                icon_name: icon.to_string(),
+                enabled,
+                // `TrayAction` ya no es `Copy`: el clon ocurre al pulsar.
+                activate: Box::new(move |t: &mut Self| t.send(action.clone())),
+                ..Default::default()
+            }
+            .into()
+        };
+        vec![
+            StandardItem {
+                label: "Abrir panel".to_string(),
+                icon_name: "window-new".to_string(),
+                activate: Box::new(|t: &mut Self| {
+                    t.show();
+                    t.send(TrayAction::Show);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            item(
+                "Iniciar motor".to_string(),
+                "media-playback-start",
+                !s.busy && s.engine_active != Some(true),
+                TrayAction::EngineStart,
+            ),
+            item(
+                "Detener motor".to_string(),
+                "media-playback-stop",
+                !s.busy && (s.engine_active == Some(true) || s.socket_active == Some(true)),
+                TrayAction::EngineStop,
+            ),
+            item(
+                "Refrescar".to_string(),
+                "view-refresh",
+                !s.busy,
+                TrayAction::Refresh,
+            ),
+            ksni::MenuItem::Separator,
+            item(
+                format!("Levantar {project}"),
+                "media-playback-start",
+                !s.busy && s.selected_can_start,
+                TrayAction::StartProject(s.selected_project.clone()),
+            ),
+            item(
+                format!("Apagar {project}"),
+                "media-playback-stop",
+                !s.busy && s.selected_running > 0,
+                TrayAction::StopProject(s.selected_project.clone()),
+            ),
+            ksni::MenuItem::Separator,
+            item(
+                "Salir".to_string(),
+                "application-exit",
+                true,
+                TrayAction::Quit,
+            ),
+        ]
+    }
+}
+
+/// Rectángulo redondeado en coordenadas normalizadas 0..1; el suavizado lo
+/// aporta el supersampling de `brand_rgba`.
+fn inside_rounded(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> bool {
+    if x < x0 || x > x1 || y < y0 || y > y1 {
+        return false;
+    }
+    let dx = (x0 + r - x).max(x - (x1 - r)).max(0.0);
+    let dy = (y0 + r - y).max(y - (y1 - r)).max(0.0);
+    dx * dx + dy * dy <= r * r
+}
+
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
+}
+
+fn inside_ellipse(x: f32, y: f32, cx: f32, cy: f32, rx: f32, ry: f32) -> bool {
+    let dx = (x - cx) / rx;
+    let dy = (y - cy) / ry;
+    dx * dx + dy * dy <= 1.0
+}
+
+/// Ray casting: cuenta los cruces del rayo horizontal con cada arista.
+fn inside_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+        let (xi, yi) = points[i];
+        let (xj, yj) = points[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Un píxel de la marca en coordenadas 0..1, en el mismo orden que el SVG.
+fn brand_pixel(x: f32, y: f32) -> [u8; 4] {
+    if !inside_rounded(x, y, 0.039, 0.039, 0.961, 0.961, 0.219) {
+        return [0, 0, 0, 0];
+    }
+    let bg = mix(ICON_TOP, ICON_BOTTOM, ((x + y) * 0.5).clamp(0.0, 1.0));
+    let tail = inside_polygon(
+        x,
+        y,
+        &[
+            (0.721, 0.631),
+            (0.900, 0.420),
+            (0.869, 0.631),
+            (0.920, 0.820),
+            (0.721, 0.721),
+        ],
+    );
+    let fin = inside_polygon(x, y, &[(0.381, 0.779), (0.480, 0.920), (0.551, 0.801)]);
+    let white = tail
+        || fin
+        || inside_ellipse(x, y, 0.459, 0.660, 0.301, 0.150)
+        || inside_ellipse(x, y, 0.350, 0.629, 0.131, 0.109);
+    if white {
+        return [255, 255, 255, 255];
+    }
+    let bars = inside_rounded(x, y, 0.310, 0.369, 0.691, 0.424, 0.027)
+        || inside_rounded(x, y, 0.310, 0.449, 0.691, 0.504, 0.027)
+        || inside_rounded(x, y, 0.310, 0.529, 0.691, 0.584, 0.027);
+    if bars || inside_ellipse(x, y, 0.270, 0.619, 0.0215, 0.0215) {
+        return [ICON_INK.r(), ICON_INK.g(), ICON_INK.b(), 255];
+    }
+    if inside_ellipse(x, y, 0.801, 0.199, 0.045, 0.045) {
+        return [ICON_ORANGE.r(), ICON_ORANGE.g(), ICON_ORANGE.b(), 255];
+    }
+    [bg.r(), bg.g(), bg.b(), 255]
+}
+
+/// RGBA con supersampling 2×2; el color se promedia ponderado por alpha para
+/// que los bordes no arrastren negro.
+fn brand_rgba(size: usize) -> Vec<u8> {
+    let mut out = vec![0u8; size * size * 4];
+    let step = 1.0 / size as f32;
+    for py in 0..size {
+        for px in 0..size {
+            let (mut acc_r, mut acc_g, mut acc_b, mut acc_a) = (0u32, 0u32, 0u32, 0u32);
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let c = brand_pixel(
+                        (px as f32 + (sx as f32 + 0.5) * 0.5) * step,
+                        (py as f32 + (sy as f32 + 0.5) * 0.5) * step,
+                    );
+                    let a = c[3] as u32;
+                    acc_r += c[0] as u32 * a;
+                    acc_g += c[1] as u32 * a;
+                    acc_b += c[2] as u32 * a;
+                    acc_a += a;
+                }
+            }
+            let i = (py * size + px) * 4;
+            let div = acc_a.max(1);
+            out[i] = (acc_r / div) as u8;
+            out[i + 1] = (acc_g / div) as u8;
+            out[i + 2] = (acc_b / div) as u8;
+            out[i + 3] = (acc_a / 4) as u8;
+        }
+    }
+    out
+}
+
+/// Nombre del icono instalado; vacío si no se instaló y hay que usar el pixmap.
+fn installed_icon_name() -> String {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let mut bases: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+            bases.push(PathBuf::from(dir));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            bases.push(PathBuf::from(home).join(".local/share"));
+        }
+        // `PREFIX=/usr/local` instala el icono en /usr/local/share: se recorre
+        // XDG_DATA_DIRS (Docker/Flatpak lo usan) además de /usr/share.
+        let dirs = std::env::var_os("XDG_DATA_DIRS")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+        bases.extend(std::env::split_paths(&dirs));
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let installed = bases.iter().filter(|b| seen.insert((*b).clone())).any(|b| {
+            b.join("icons/hicolor/scalable/apps/cinnamon-docker.svg")
+                .is_file()
+        });
+        if installed {
+            "cinnamon-docker".to_string()
+        } else {
+            String::new()
+        }
+    })
+    .clone()
+}
+
+fn tray_icon() -> ksni::Icon {
+    static ICON: LazyLock<ksni::Icon> = LazyLock::new(|| {
+        let rgba = brand_rgba(128);
+        // ksni espera ARGB, no RGBA.
+        let data = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, a]| [a, r, g, b])
+            .collect();
+        ksni::Icon {
+            width: 128,
+            height: 128,
+            data,
+        }
+    });
+    ICON.clone()
+}
+
+fn app_icon() -> egui::IconData {
+    egui::IconData {
+        rgba: brand_rgba(128),
+        width: 128,
+        height: 128,
+    }
+}
+
 // ── app ────────────────────────────────────────────────────────────────────
 
 struct App {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
+    theme: ThemeMode,
     engine_active: Option<bool>,
     socket_active: Option<bool>,
     docker_version: String,
@@ -1149,13 +1829,80 @@ struct App {
     stats_at: Option<Instant>,
     stats_refreshing: bool,
     stats_error: Option<String>,
+    /// Proyecto compose sobre el que actúan los botones del header; "" =
+    /// «Sin proyecto».
+    selected_project: String,
+    tray_handle: Option<ksni::blocking::Handle<CinnamonTray>>,
+    tray_state: Arc<Mutex<TrayState>>,
+    tray_ok: bool,
+    tray_ctx_set: bool,
+    allow_close: bool,
+    show_requested: bool,
+    quit_requested: bool,
+}
+
+/// Botones del motor, reutilizados en la fila 1 (ancho) o la fila 2 (estrecho).
+/// Devuelve (iniciar, detener, refrescar).
+fn engine_buttons(
+    ui: &mut egui::Ui,
+    active: Option<bool>,
+    socket: Option<bool>,
+    busy: bool,
+) -> (bool, bool, bool) {
+    let mut start = false;
+    let mut stop = false;
+    let mut refresh = false;
+    if ui.button("Refrescar").clicked() {
+        refresh = true;
+    }
+    let idle = !busy;
+    if ui
+        .add_enabled(
+            idle && (active == Some(true) || socket == Some(true)),
+            egui::Button::new("Detener motor"),
+        )
+        .clicked()
+    {
+        stop = true;
+    }
+    if ui
+        .add_enabled(
+            idle && active != Some(true),
+            egui::Button::new("Iniciar motor"),
+        )
+        .clicked()
+    {
+        start = true;
+    }
+    if busy {
+        ui.label(
+            egui::RichText::new("esperando polkit…")
+                .size(11.0)
+                .color(pal().muted),
+        );
+        ui.spinner();
+    }
+    (start, stop, refresh)
 }
 
 impl App {
     fn new(tx: Sender<Msg>, rx: Receiver<Msg>) -> Self {
+        let theme = load_theme();
+        set_current_mode(theme);
+        let tray_state = Arc::new(Mutex::new(TrayState::default()));
+        let tray = CinnamonTray {
+            tx: tx.clone(),
+            state: tray_state.clone(),
+            ctx: None,
+        };
+        let (tray_handle, tray_ok, tray_err) = match tray.spawn() {
+            Ok(h) => (Some(h), true, None),
+            Err(e) => (None, false, Some(e.to_string())),
+        };
         let mut app = Self {
             tx,
             rx,
+            theme,
             engine_active: None,
             socket_active: None,
             docker_version: String::new(),
@@ -1173,9 +1920,21 @@ impl App {
             stats_at: None,
             stats_refreshing: false,
             stats_error: None,
+            selected_project: CINNAMON_PROJECT.to_string(),
+            tray_handle,
+            tray_state,
+            tray_ok,
+            tray_ctx_set: false,
+            allow_close: false,
+            show_requested: false,
+            quit_requested: false,
         };
         spawn_refresh(app.tx.clone());
         app.log_push("Panel listo. Refresco automático cada 2s.");
+        match tray_err {
+            Some(e) => app.log_push(format!("Bandeja no disponible: {e}")),
+            None => app.log_push("Bandeja: icono registrado (SNI)."),
+        }
         if pkexec_bin().is_none() {
             app.log_push(format!(
                 "Aviso: {PKEXEC} no existe; iniciar/detener motor usará systemctl directo."
@@ -1189,6 +1948,17 @@ impl App {
         while self.log.len() > LOG_CAP {
             self.log.pop_front();
         }
+    }
+
+    fn set_theme(&mut self, ctx: &egui::Context, mode: ThemeMode) {
+        if mode == self.theme {
+            return;
+        }
+        self.theme = mode;
+        set_current_mode(mode);
+        apply_theme(ctx, mode);
+        save_theme(mode);
+        self.log_push(format!("Tema: {}", mode.label()));
     }
 
     fn drain(&mut self) {
@@ -1209,6 +1979,20 @@ impl App {
                     self.containers = containers;
                     self.compose_error = error;
                     self.refreshing = false;
+                    // Si el proyecto elegido desapareció, cae en cinnamon (o en
+                    // el primer proyecto con nombre); si sigue, no se toca.
+                    let projects = self.project_list();
+                    if !projects.contains(&self.selected_project) {
+                        self.selected_project = if projects.iter().any(|p| p == CINNAMON_PROJECT) {
+                            CINNAMON_PROJECT.to_string()
+                        } else {
+                            projects
+                                .iter()
+                                .find(|p| !p.is_empty())
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+                    }
                     if !active {
                         // Motor apagado: las métricas previas ya no valen.
                         self.stats.clear();
@@ -1245,8 +2029,53 @@ impl App {
                         spawn_refresh(self.tx.clone());
                     }
                 }
+                Msg::Tray(action) => match action {
+                    TrayAction::Show => self.show_requested = true,
+                    TrayAction::EngineStart => {
+                        if !self.engine_busy && self.engine_active != Some(true) {
+                            self.engine_busy = true;
+                            engine_action(self.tx.clone(), true);
+                        }
+                    }
+                    TrayAction::EngineStop => {
+                        // El modal de confirmación solo se pinta en `ui`.
+                        self.show_requested = true;
+                        self.confirm_stop_engine = true;
+                    }
+                    TrayAction::Refresh => self.request_refresh(),
+                    TrayAction::StartProject(project) => self.start_project(&project),
+                    TrayAction::StopProject(project) => self.stop_project(&project),
+                    TrayAction::Quit => self.quit_requested = true,
+                },
             }
         }
+    }
+
+    /// Publica en la bandeja solo lo que cambió: evita repintar el icono cada
+    /// ciclo de 500 ms.
+    fn sync_tray(&mut self) {
+        let Some(handle) = &self.tray_handle else {
+            return;
+        };
+        let items = self.selected_items();
+        let selected_running = items.iter().filter(|c| c.is_up()).count();
+        let next = TrayState {
+            engine_active: self.engine_active,
+            socket_active: self.socket_active,
+            busy: self.engine_busy || self.global_busy,
+            selected_project: self.selected_project.clone(),
+            selected_running,
+            selected_stopped: items.len() - selected_running,
+            selected_can_start: can_start_project(&self.selected_project, &items),
+        };
+        let changed = self.tray_state.lock().map(|s| *s != next).unwrap_or(true);
+        if !changed {
+            return;
+        }
+        if let Ok(mut s) = self.tray_state.lock() {
+            *s = next;
+        }
+        handle.update(|_| ());
     }
 
     fn request_refresh(&mut self) {
@@ -1285,143 +2114,273 @@ impl App {
         any.then_some((cpu, used, limit, pct))
     }
 
+    /// Proyectos presentes, cinnamon primero, resto alfabético, "" al final.
+    /// Cinnamon se añade siempre: sin contenedores (motor apagado o stack nunca
+    /// levantado) el selector debe poder lanzar el compose desde cero.
+    fn project_list(&self) -> Vec<String> {
+        let mut keys: Vec<String> = std::iter::once(CINNAMON_PROJECT.to_string())
+            .chain(self.containers.iter().map(|c| c.project.clone()))
+            .collect();
+        keys.sort_by_key(|k| project_rank(k));
+        keys.dedup();
+        keys
+    }
+
+    fn selected_items(&self) -> Vec<Container> {
+        self.containers
+            .iter()
+            .filter(|c| c.project == self.selected_project)
+            .cloned()
+            .collect()
+    }
+
+    fn selected_label(&self) -> String {
+        group_key(&self.selected_project)
+    }
+
+    fn start_selected(&mut self) {
+        let project = self.selected_project.clone();
+        self.start_project(&project);
+    }
+
+    fn start_project(&mut self, project: &str) {
+        if self.global_busy {
+            return;
+        }
+        let items: Vec<Container> = self
+            .containers
+            .iter()
+            .filter(|c| c.project == project)
+            .cloned()
+            .collect();
+        if project != CINNAMON_PROJECT && items.is_empty() {
+            return;
+        }
+        self.global_busy = true;
+        if project == CINNAMON_PROJECT {
+            start_all(self.tx.clone());
+        } else {
+            group_start(self.tx.clone(), project.to_string(), items);
+        }
+    }
+
+    fn stop_selected(&mut self) {
+        let project = self.selected_project.clone();
+        self.stop_project(&project);
+    }
+
+    fn stop_project(&mut self, project: &str) {
+        if self.global_busy {
+            return;
+        }
+        let items: Vec<Container> = self
+            .containers
+            .iter()
+            .filter(|c| c.project == project)
+            .cloned()
+            .collect();
+        if project != CINNAMON_PROJECT && items.is_empty() {
+            return;
+        }
+        self.global_busy = true;
+        if project == CINNAMON_PROJECT {
+            // Cinnamon se apaga con compose stop (conserva la red y el orden).
+            stop_all(self.tx.clone());
+        } else {
+            group_stop(self.tx.clone(), project.to_string(), items);
+        }
+    }
+
     fn header(&mut self, ui: &mut egui::Ui) {
         let mut do_start = false;
         let mut ask_stop = false;
         let mut do_refresh = false;
-        let mut want_start_all = false;
-        let mut want_stop_all = false;
+        let mut do_start_selected = false;
+        let mut do_stop_selected = false;
+        let mut theme_req = None;
         let narrow = ui.available_width() < 1100.0;
+        let (active, socket, engine_busy) =
+            (self.engine_active, self.socket_active, self.engine_busy);
+        let theme = self.theme;
 
         ui.horizontal(|ui| {
+            brand_mark(ui, 34.0);
+            ui.add_space(6.0);
             ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
                 ui.label(
                     egui::RichText::new("Docker Cinnamon")
-                        .size(20.0)
+                        .size(26.0)
                         .strong()
-                        .color(TEXT),
+                        .color(pal().text),
                 );
                 let version = if self.docker_version.is_empty() {
-                    "docker —".to_string()
-                } else if narrow {
-                    format!("Docker {}", short_docker_version(&self.docker_version))
+                    "Docker —".to_string()
                 } else {
-                    self.docker_version.clone()
+                    format!(
+                        "Docker {} · panel de contenedores",
+                        short_docker_version(&self.docker_version)
+                    )
                 };
-                ui.label(egui::RichText::new(version).size(11.0).color(MUTED));
+                ui.label(egui::RichText::new(version).size(12.0).color(pal().muted));
             });
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             match self.engine_active {
-                Some(true) => dot_pill(ui, OK, "Motor activo"),
-                Some(false) => dot_pill(ui, ERR, "Motor detenido"),
-                None => dot_pill(ui, MUTED, "Motor desconocido"),
+                Some(true) => dot_pill(ui, pal().ok, "Motor activo"),
+                Some(false) => dot_pill(ui, pal().err, "Motor detenido"),
+                None => dot_pill(ui, pal().muted, "Motor desconocido"),
             };
             match (self.socket_active, self.engine_active) {
-                (Some(true), Some(false)) => pill(ui, "socket activo", WARN),
-                (Some(true), _) => pill(ui, "socket activo", MUTED),
-                (Some(false), _) => pill(ui, "socket detenido", MUTED),
-                (None, _) => pill(ui, "socket —", MUTED),
+                (Some(true), Some(false)) => pill(ui, "socket activo", pal().warn),
+                (Some(true), _) => pill(ui, "socket activo", pal().muted),
+                (Some(false), _) => pill(ui, "socket detenido", pal().muted),
+                (None, _) => pill(ui, "socket —", pal().muted),
             };
-            match self.stats_total() {
-                Some((cpu, used, limit, pct)) => {
-                    pill(ui, format!("CPU {cpu:.1}%"), MUTED);
-                    pill(
-                        ui,
-                        format!(
-                            "RAM {} / {} ({pct:.1}%)",
-                            human_bytes(used),
-                            human_bytes(limit)
-                        ),
-                        MUTED,
-                    );
-                }
-                None => {
-                    pill(ui, "CPU —", MUTED);
-                    pill(ui, "RAM —", MUTED);
-                }
-            }
             let up = self.containers.iter().filter(|c| c.is_up()).count();
-            pill(ui, format!("{up}/{} arriba", self.containers.len()), MUTED);
+            pill(
+                ui,
+                format!("{up}/{} arriba", self.containers.len()),
+                pal().muted,
+            );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Refrescar").clicked() {
-                    do_refresh = true;
-                }
-                let idle = !self.engine_busy;
-                if ui
-                    .add_enabled(
-                        idle && (self.engine_active == Some(true)
-                            || self.socket_active == Some(true)),
-                        egui::Button::new("Detener motor"),
-                    )
-                    .clicked()
-                {
-                    ask_stop = true;
-                }
-                if ui
-                    .add_enabled(
-                        idle && self.engine_active != Some(true),
-                        egui::Button::new("Iniciar motor"),
-                    )
-                    .clicked()
-                {
-                    do_start = true;
-                }
-                if self.engine_busy {
-                    ui.label(
-                        egui::RichText::new("esperando polkit…")
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                    ui.spinner();
+                theme_req = theme_switch(ui, theme);
+                if !narrow {
+                    let (s, p, r) = engine_buttons(ui, active, socket, engine_busy);
+                    do_start |= s;
+                    ask_stop |= p;
+                    do_refresh |= r;
+                    // En estrecho los totales ya se ven en las tarjetas resumen.
+                    match self.stats_total() {
+                        Some((cpu, used, limit, pct)) => {
+                            pill(
+                                ui,
+                                format!(
+                                    "RAM {} / {} ({pct:.1}%)",
+                                    human_bytes(used),
+                                    human_bytes(limit)
+                                ),
+                                pal().muted,
+                            );
+                            pill(ui, format!("CPU {cpu:.1}%"), pal().muted);
+                        }
+                        None => {
+                            pill(ui, "RAM —", pal().muted);
+                            pill(ui, "CPU —", pal().muted);
+                        }
+                    }
                 }
             });
         });
 
-        ui.horizontal(|ui| {
-            let idle = !self.global_busy;
-            if ui
-                .add_enabled(
-                    idle,
-                    egui::Button::new(
-                        egui::RichText::new("Levantar todo (serie)")
-                            .color(BG)
-                            .strong(),
-                    )
-                    .fill(ACCENT)
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(8),
-                )
-                .on_hover_text("Arranca postgres → mongo → apps esperando healthy")
-                .clicked()
-            {
-                want_start_all = true;
-            }
-            if ui
-                .add_enabled(
-                    idle,
-                    egui::Button::new(format!("Apagar todo ({})", CINNAMON_PROJECT)),
-                )
-                .on_hover_text("docker compose stop del stack Cinnamon")
-                .clicked()
-            {
-                want_stop_all = true;
-            }
-            if self.global_busy {
-                ui.spinner();
-                ui.label(
-                    egui::RichText::new("operación en curso…")
+        if let Some(mode) = theme_req {
+            self.set_theme(ui.ctx(), mode);
+        }
+
+        // Bloque 2: selector de proyecto y acciones sobre el grupo elegido.
+        ui.add_space(10.0);
+        let projects = self.project_list();
+        let mut selected = self.selected_project.clone();
+        let sel_items = self.selected_items();
+        let idle = !self.global_busy;
+        // Cinnamon siempre se puede lanzar: el compose crea los contenedores, así
+        // que 0 arriba es un caso válido (solo se deshabilita con los 8 en marcha).
+        let can_start = idle && can_start_project(&selected, &sel_items);
+        let can_stop = idle && sel_items.iter().any(|c| c.is_up());
+        let total = self.containers.len();
+        let global_busy = self.global_busy;
+
+        egui::Frame::new()
+            .fill(pal().card)
+            .corner_radius(16)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .stroke(egui::Stroke::new(1.0, pal().border))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("project_selector")
+                        .selected_text(self.selected_label())
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for p in &projects {
+                                ui.selectable_value(&mut selected, p.clone(), group_key(p));
+                            }
+                        });
+                    let primary = ui
+                        .scope(|ui| {
+                            ui.spacing_mut().button_padding = egui::vec2(16.0, 8.0);
+                            ui.add_enabled(
+                                can_start,
+                                egui::Button::new(
+                                    egui::RichText::new(format!(
+                                        "Levantar {}",
+                                        group_key(&selected)
+                                    ))
+                                    .size(12.5)
+                                    .color(pal().on_accent)
+                                    .strong(),
+                                )
+                                .fill(pal().accent)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(12),
+                            )
+                        })
+                        .inner;
+                    if primary
+                        .on_hover_text(if selected == CINNAMON_PROJECT {
+                            "Arranque en serie con espera healthy"
+                        } else {
+                            "docker start secuencial de los contenedores parados del proyecto"
+                        })
+                        .clicked()
+                    {
+                        do_start_selected = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            can_stop,
+                            egui::Button::new(
+                                egui::RichText::new(format!("Apagar {}", group_key(&selected)))
+                                    .size(12.5)
+                                    .color(if can_stop { pal().err } else { pal().muted }),
+                            )
+                            .fill(tint(pal().err, if can_stop { 18 } else { 8 }))
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(12),
+                        )
+                        .on_hover_text("Detiene los contenedores en marcha de este proyecto")
+                        .clicked()
+                    {
+                        do_stop_selected = true;
+                    }
+                    let count = total;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{count} contenedor{}",
+                            if count == 1 { "" } else { "es" }
+                        ))
                         .size(11.0)
-                        .color(MUTED),
-                );
-            }
-            ui.separator();
-            ui.label(
-                egui::RichText::new(format!("{} contenedor(es)", self.containers.len()))
-                    .size(11.0)
-                    .color(MUTED),
-            );
-        });
+                        .color(pal().muted),
+                    );
+                    if global_busy {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("operación en curso…")
+                                .size(11.0)
+                                .color(pal().muted),
+                        );
+                    }
+                    if narrow {
+                        let (s, p, r) = engine_buttons(ui, active, socket, engine_busy);
+                        do_start |= s;
+                        ask_stop |= p;
+                        do_refresh |= r;
+                    }
+                });
+            });
+
+        if selected != self.selected_project {
+            self.selected_project = selected;
+        }
 
         if do_refresh {
             self.request_refresh();
@@ -1434,19 +2393,11 @@ impl App {
             // "Detener motor" apaga TODOS los contenedores: confirmación explícita.
             self.confirm_stop_engine = true;
         }
-        if want_start_all {
-            self.global_busy = true;
-            let items = self
-                .containers
-                .iter()
-                .filter(|c| c.project == CINNAMON_PROJECT)
-                .cloned()
-                .collect();
-            start_all(self.tx.clone(), items);
+        if do_start_selected {
+            self.start_selected();
         }
-        if want_stop_all {
-            self.global_busy = true;
-            stop_all(self.tx.clone());
+        if do_stop_selected {
+            self.stop_selected();
         }
     }
 
@@ -1456,34 +2407,59 @@ impl App {
             return false;
         }
         let mut choice: Option<bool> = None;
-        egui::Modal::new(egui::Id::unique("confirm_stop_engine")).show(ctx, |ui| {
-            ui.set_max_width(520.0);
-            ui.label(
-                egui::RichText::new("¿Detener el motor Docker?")
-                    .size(16.0)
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                "Se detendrá el motor y se apagarán TODOS los contenedores de TODOS \
-                 los proyectos (no solo Cinnamon). Los datos en volúmenes se conservan.",
-            );
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(engine_command(false))
-                    .monospace()
-                    .weak(),
-            );
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("Sí, detener todo").clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("Cancelar").clicked() {
-                    choice = Some(false);
-                }
+        let frame = egui::Frame::new()
+            .fill(pal().surface)
+            .corner_radius(20)
+            .inner_margin(egui::Margin::same(18))
+            .stroke(egui::Stroke::new(1.0, pal().border))
+            .shadow(egui::Shadow {
+                offset: [0, 10],
+                blur: 30,
+                spread: 0,
+                color: pal().card_shadow,
             });
-        });
+        egui::Modal::new(egui::Id::unique("confirm_stop_engine"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.label(
+                    egui::RichText::new("¿Detener el motor Docker?")
+                        .size(18.0)
+                        .strong()
+                        .color(pal().text),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Se detendrá el motor y se apagarán TODOS los contenedores de TODOS \
+                         los proyectos (no solo Cinnamon). Los datos en volúmenes se conservan.",
+                    )
+                    .size(13.0)
+                    .color(pal().text),
+                );
+                ui.add_space(10.0);
+                egui::Frame::new()
+                    .fill(tint(pal().muted, 10))
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(engine_command(false))
+                                .monospace()
+                                .size(12.0)
+                                .color(pal().muted),
+                        );
+                    });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if soft_button(ui, "Sí, detener todo", pal().err, true).clicked() {
+                        choice = Some(true);
+                    }
+                    if soft_button(ui, "Cancelar", pal().muted, true).clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
         match choice {
             Some(true) => {
                 self.confirm_stop_engine = false;
@@ -1506,29 +2482,33 @@ impl App {
         let mut container_action_req: Option<(Container, ContainerOp)> = None;
 
         if let Some(notice) = self.notice.clone() {
-            ui.add_space(2.0);
+            let color = if notice.error { pal().err } else { pal().ok };
             egui::Frame::new()
-                .inner_margin(8.0)
-                .corner_radius(8)
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    tint(if notice.error { ERR } else { OK }, 70),
-                ))
-                .fill(tint(if notice.error { ERR } else { OK }, 28))
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .corner_radius(16)
+                .fill(tint(color, 14))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
                             egui::RichText::new(&notice.text)
-                                .color(if notice.error { ERR } else { OK })
-                                .monospace(),
+                                .size(12.0)
+                                .monospace()
+                                .color(color),
                         );
                         if ui.small_button("ocultar").clicked() {
                             self.notice = None;
                         }
                     });
                     if let Some(cmd) = notice.command.clone() {
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&cmd).monospace().strong());
+                            ui.label(
+                                egui::RichText::new(&cmd)
+                                    .size(12.0)
+                                    .monospace()
+                                    .strong()
+                                    .color(pal().text),
+                            );
                             if ui.small_button("Copiar comando").clicked() {
                                 ui.ctx().copy_text(cmd.clone());
                                 self.log_push(format!("copiado al portapapeles: {cmd}"));
@@ -1538,42 +2518,88 @@ impl App {
                             egui::RichText::new(
                                 "Pégalo en una terminal (Konsole) si polkit no muestra el diálogo.",
                             )
-                            .weak(),
+                            .size(11.0)
+                            .color(pal().muted),
                         );
                     }
                 });
+            ui.add_space(10.0);
         }
         if let Some(err) = self.compose_error.clone() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(format!("docker ps: {err}")).color(ERR));
-            });
+            egui::Frame::new()
+                .fill(tint(pal().err, 12))
+                .corner_radius(14)
+                .inner_margin(egui::Margin::symmetric(14, 8))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("docker ps: {err}"))
+                            .size(12.0)
+                            .color(pal().err),
+                    );
+                });
+            ui.add_space(10.0);
         }
 
-        ui.separator();
+        let up = self.containers.iter().filter(|c| c.is_up()).count();
+        let total = self.containers.len();
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.columns(3, |cols| {
+                match self.stats_total() {
+                    Some((cpu, used, limit, pct)) => {
+                        summary_card(
+                            &mut cols[0],
+                            "CPU total",
+                            &format!("{cpu:.1}%"),
+                            "suma de contenedores",
+                        );
+                        summary_card(
+                            &mut cols[1],
+                            "RAM total",
+                            &human_bytes(used),
+                            &format!("de {} · {pct:.1}%", human_bytes(limit)),
+                        );
+                    }
+                    None => {
+                        summary_card(&mut cols[0], "CPU total", "—", "sin datos aún");
+                        summary_card(&mut cols[1], "RAM total", "—", "sin datos aún");
+                    }
+                }
+                summary_card(
+                    &mut cols[2],
+                    "Contenedores",
+                    &format!("{up}/{total}"),
+                    "arriba",
+                );
+            });
+        });
+        ui.add_space(16.0);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // ── todos los contenedores del daemon ──────────────────────
                 ui.label(
-                    egui::RichText::new("Contenedores (docker ps -a)")
+                    egui::RichText::new("Contenedores")
                         .strong()
-                        .size(15.0),
+                        .size(20.0)
+                        .color(pal().text),
                 );
                 ui.label(
                     egui::RichText::new(
-                        "Todos los proyectos del daemon. Agrupados por proyecto compose; «Sin proyecto» para contenedores sueltos.",
+                        "Todos los proyectos del daemon, agrupados por proyecto compose.",
                     )
-                    .weak(),
+                    .size(12.0)
+                    .color(pal().muted),
                 );
                 ui.add_space(4.0);
                 if containers.is_empty() {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         egui::Frame::new()
-                            .fill(CARD)
-                            .stroke(egui::Stroke::new(1.0, BORDER))
-                            .corner_radius(10)
+                            .fill(pal().card)
+                            .stroke(egui::Stroke::new(1.0, pal().border))
+                            .corner_radius(18)
                             .inner_margin(egui::Margin::symmetric(12, 16))
                             .show(ui, |ui| {
                                 ui.set_width(360.0);
@@ -1581,14 +2607,14 @@ impl App {
                                     ui.label(
                                         egui::RichText::new("Sin contenedores (o motor detenido).")
                                             .size(14.0)
-                                            .color(TEXT),
+                                            .color(pal().text),
                                     );
                                     ui.label(
                                         egui::RichText::new(
                                             "Arranca el motor o levanta el stack para ver las tarjetas.",
                                         )
                                         .size(11.0)
-                                        .color(MUTED),
+                                        .color(pal().muted),
                                     );
                                 });
                             });
@@ -1603,17 +2629,8 @@ impl App {
                         .push(c.clone());
                 }
                 let mut keys: Vec<String> = groups.keys().cloned().collect();
-                keys.sort_by_key(|k| {
-                    if k == CINNAMON_PROJECT {
-                        format!("0{k}")
-                    } else if k.is_empty() {
-                        format!("2{k}")
-                    } else {
-                        format!("1{k}")
-                    }
-                });
+                keys.sort_by_key(|k| project_rank(k));
 
-                let mut first_group = true;
                 for key in keys {
                     let mut items = groups.remove(&key).unwrap_or_default();
                     let label = group_key(&key);
@@ -1631,26 +2648,25 @@ impl App {
                     } else {
                         items.sort_by(|a, b| a.name.cmp(&b.name));
                     }
-                    if first_group {
-                        first_group = false;
-                    } else {
-                        ui.separator();
-                    }
-                    ui.add_space(14.0);
+                    let wide = ui.available_width() > 720.0;
+                    ui.add_space(18.0);
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(&label)
                                 .strong()
-                                .color(if key == CINNAMON_PROJECT { INFO } else { TEXT }),
+                                .size(16.0)
+                                .color(if key == CINNAMON_PROJECT {
+                                    pal().info
+                                } else {
+                                    pal().text
+                                }),
                         );
-                        ui.label(
-                            egui::RichText::new(format!("{up}/{} arriba", items.len()))
-                                .size(11.0)
-                                .color(MUTED),
+                        pill(
+                            ui,
+                            format!("{up}/{}", items.len()),
+                            if up > 0 { pal().ok } else { pal().muted },
                         );
-                        ui.add_space(8.0);
-                        if ui
-                            .add_enabled(can_start, egui::Button::new("Arrancar todos"))
+                        if soft_button(ui, "Arrancar todos", pal().accent, can_start)
                             .on_hover_text(if key == CINNAMON_PROJECT {
                                 "Serie con espera healthy: postgres → mongo → apps"
                             } else {
@@ -1660,17 +2676,14 @@ impl App {
                         {
                             req_group_start = Some((key.clone(), items.clone()));
                         }
-                        if ui
-                            .add_enabled(can_stop, egui::Button::new("Detener todos"))
-                            .clicked()
-                        {
+                        if soft_button(ui, "Detener todos", pal().err, can_stop).clicked() {
                             req_group_stop = Some((key.clone(), items.clone()));
                         }
-                        if key == CINNAMON_PROJECT {
+                        if key == CINNAMON_PROJECT && wide {
                             ui.label(
                                 egui::RichText::new("orden serie + healthy")
                                     .size(11.0)
-                                    .color(MUTED),
+                                    .color(pal().muted),
                             );
                             let svc_up = SERVICES
                                 .iter()
@@ -1686,49 +2699,62 @@ impl App {
                                     SERVICES.len()
                                 ))
                                 .size(11.0)
-                                .color(MUTED),
+                                .color(pal().muted),
                             );
                         }
                     });
+                    ui.add_space(10.0);
 
                     for c in &items {
                         let busy = self.busy_containers.contains(&c.name);
                         let blocked = busy || self.global_busy;
                         let stats = self.stats_for(c);
+                        // En tarjetas estrechas la pill de servicio no cabe sin
+                        // solaparse con las acciones: el nombre ya la contiene.
+                        let compact = ui.available_width() < 620.0;
                         egui::Frame::new()
-                            .fill(CARD)
-                            .stroke(egui::Stroke::new(1.0, BORDER))
-                            .corner_radius(10)
-                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .fill(pal().card)
+                            .stroke(egui::Stroke::new(1.0, pal().border))
+                            .corner_radius(18)
+                            .inner_margin(egui::Margin::symmetric(16, 12))
+                            .shadow(egui::Shadow {
+                                offset: [0, 1],
+                                blur: 10,
+                                spread: 0,
+                                color: pal().card_shadow,
+                            })
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 // Línea 1: estado, nombre, chips y acciones.
                                 ui.horizontal(|ui| {
+                                    let max_name = if compact { 130.0 } else { 220.0 };
                                     let name_w =
-                                        text_width(ui, &c.name, 13.0, true).min(220.0);
+                                        text_width(ui, &c.name, 14.0, true).min(max_name);
                                     status_dot(ui, container_state_color(c));
                                     clipped_label(
                                         ui,
                                         egui::RichText::new(&c.name)
                                             .monospace()
-                                            .size(13.0)
+                                            .size(14.0)
                                             .strong()
-                                            .color(TEXT),
+                                            .color(pal().text),
                                         name_w,
-                                        16.0,
+                                        17.0,
                                     )
                                     .on_hover_text(&c.name);
-                                    pill(
-                                        ui,
-                                        if c.service.is_empty() {
-                                            "—"
-                                        } else {
-                                            c.service.as_str()
-                                        },
-                                        INFO,
-                                    )
-                                    .on_hover_text("servicio compose");
+                                    if !compact {
+                                        pill(
+                                            ui,
+                                            if c.service.is_empty() {
+                                                "—"
+                                            } else {
+                                                c.service.as_str()
+                                            },
+                                            pal().info,
+                                        )
+                                        .on_hover_text("servicio compose");
+                                    }
                                     pill(
                                         ui,
                                         if c.state.is_empty() {
@@ -1749,43 +2775,42 @@ impl App {
                                             if busy {
                                                 ui.spinner();
                                             }
-                                            if ui
-                                                .add_enabled(
-                                                    !blocked,
-                                                    egui::Button::new("Logs").small(),
-                                                )
+                                            if soft_button(ui, "Logs", pal().muted, !blocked)
                                                 .clicked()
                                             {
                                                 container_action_req =
                                                     Some((c.clone(), ContainerOp::Logs));
                                             }
                                             if c.is_up() {
-                                                if ui
-                                                    .add_enabled(
-                                                        !blocked,
-                                                        egui::Button::new("Reiniciar").small(),
-                                                    )
-                                                    .clicked()
+                                                if soft_button(
+                                                    ui,
+                                                    "Reiniciar",
+                                                    pal().muted,
+                                                    !blocked,
+                                                )
+                                                .clicked()
                                                 {
                                                     container_action_req =
                                                         Some((c.clone(), ContainerOp::Restart));
                                                 }
-                                                if ui
-                                                    .add_enabled(
-                                                        !blocked,
-                                                        egui::Button::new("Detener").small(),
-                                                    )
-                                                    .clicked()
+                                                if soft_button(
+                                                    ui,
+                                                    "Detener",
+                                                    pal().err,
+                                                    !blocked,
+                                                )
+                                                .clicked()
                                                 {
                                                     container_action_req =
                                                         Some((c.clone(), ContainerOp::Stop));
                                                 }
-                                            } else if ui
-                                                .add_enabled(
-                                                    !blocked,
-                                                    egui::Button::new("Iniciar").small(),
-                                                )
-                                                .clicked()
+                                            } else if soft_button(
+                                                ui,
+                                                "Iniciar",
+                                                pal().accent,
+                                                !blocked,
+                                            )
+                                            .clicked()
                                             {
                                                 container_action_req =
                                                     Some((c.clone(), ContainerOp::Start));
@@ -1804,19 +2829,19 @@ impl App {
                                         ui,
                                         egui::RichText::new(&c.image)
                                             .size(11.0)
-                                            .color(MUTED),
+                                            .color(pal().muted),
                                         img_w,
                                         14.0,
                                     )
                                     .on_hover_text(&c.image);
                                     ui.label(
-                                        egui::RichText::new("·").size(11.0).color(MUTED),
+                                        egui::RichText::new("·").size(11.0).color(pal().muted),
                                     );
                                     clipped_label(
                                         ui,
                                         egui::RichText::new(&c.status)
                                             .size(11.0)
-                                            .color(MUTED),
+                                            .color(pal().muted),
                                         status_w,
                                         14.0,
                                     )
@@ -1833,7 +2858,7 @@ impl App {
                                                                 st.pids
                                                             ))
                                                             .size(10.0)
-                                                            .color(MUTED),
+                                                            .color(pal().muted),
                                                         );
                                                     }
                                                     stat_text(
@@ -1845,14 +2870,14 @@ impl App {
                                                             st.mem_pct
                                                         ),
                                                         Some(st.mem_pct / 100.0),
-                                                        ACCENT,
+                                                        pal().accent,
                                                     );
                                                     stat_text(
                                                         ui,
                                                         "CPU",
                                                         format!("{:.1}%", st.cpu),
                                                         Some(st.cpu / 100.0),
-                                                        ACCENT,
+                                                        pal().accent,
                                                     );
                                                 }
                                                 None => {
@@ -1861,14 +2886,14 @@ impl App {
                                                         "RAM",
                                                         "—".to_string(),
                                                         None,
-                                                        MUTED,
+                                                        pal().muted,
                                                     );
                                                     stat_text(
                                                         ui,
                                                         "CPU",
                                                         "—".to_string(),
                                                         None,
-                                                        MUTED,
+                                                        pal().muted,
                                                     );
                                                 }
                                             }
@@ -1876,7 +2901,7 @@ impl App {
                                     );
                                 });
                             });
-                        ui.add_space(6.0);
+                        ui.add_space(10.0);
                     }
                 }
             });
@@ -1897,33 +2922,62 @@ impl App {
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Log").strong().color(TEXT));
-            if ui.small_button("Limpiar").clicked() {
-                self.log.clear();
-            }
-            if ui
-                .small_button("Copiar")
-                .on_hover_text("Copia todo el log al portapapeles")
-                .clicked()
-            {
-                ui.ctx()
-                    .copy_text(self.log.iter().cloned().collect::<Vec<_>>().join("\n"));
-            }
+            ui.label(
+                egui::RichText::new("Actividad")
+                    .size(15.0)
+                    .strong()
+                    .color(pal().text),
+            );
             ui.label(
                 egui::RichText::new(format!("{} / {LOG_CAP}", self.log.len()))
                     .size(11.0)
-                    .color(MUTED),
+                    .color(pal().muted),
             );
-        });
-        ui.add_space(4.0);
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for line in &self.log {
-                    ui.label(egui::RichText::new(line).monospace().size(11.5).color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if soft_button(ui, "Salir", pal().muted, true)
+                    .on_hover_text("Cierra la aplicación (también puedes usar Salir en la bandeja)")
+                    .clicked()
+                {
+                    self.allow_close = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if soft_button(ui, "Copiar", pal().muted, true)
+                    .on_hover_text("Copia todo el log al portapapeles")
+                    .clicked()
+                {
+                    ui.ctx()
+                        .copy_text(self.log.iter().cloned().collect::<Vec<_>>().join("\n"));
+                }
+                if soft_button(ui, "Limpiar", pal().muted, true).clicked() {
+                    self.log.clear();
                 }
             });
+        });
+        ui.add_space(10.0);
+        let rest = egui::vec2(ui.available_width(), ui.available_height());
+        ui.allocate_ui_with_layout(rest, egui::Layout::top_down(egui::Align::Min), |ui| {
+            egui::Frame::new()
+                .fill(tint(pal().muted, 8))
+                .corner_radius(14)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.set_min_height(ui.available_height());
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            for line in &self.log {
+                                ui.label(
+                                    egui::RichText::new(line)
+                                        .monospace()
+                                        .size(11.5)
+                                        .color(pal().text),
+                                );
+                            }
+                        });
+                });
+        });
     }
 }
 
@@ -1938,26 +2992,25 @@ fn group_tag(project: &str) -> String {
 
 fn container_state_color(c: &Container) -> egui::Color32 {
     match c.state.as_str() {
-        "running" => OK,
-        "exited" | "dead" => ERR,
-        "restarting" | "paused" | "created" => WARN,
-        _ => MUTED,
+        "running" => pal().ok,
+        "exited" | "dead" => pal().err,
+        "restarting" | "paused" | "created" => pal().warn,
+        _ => pal().muted,
     }
 }
 
 fn health_color_str(health: &str) -> egui::Color32 {
     match health {
-        "healthy" => OK,
-        "unhealthy" => ERR,
-        "starting" => WARN,
-        _ => MUTED,
+        "healthy" => pal().ok,
+        "unhealthy" => pal().err,
+        "starting" => pal().warn,
+        _ => pal().muted,
     }
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
-        self.confirm_stop_modal(ui.ctx());
 
         if !self.refreshing && self.last_refresh.elapsed() >= REFRESH_EVERY {
             self.request_refresh();
@@ -1969,30 +3022,70 @@ impl eframe::App for App {
             self.stats_refreshing = true;
             spawn_stats(self.tx.clone());
         }
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(Duration::from_millis(500));
+
+        if !self.tray_ctx_set {
+            if let Some(h) = &self.tray_handle {
+                h.update(|t| t.ctx = Some(ctx.clone()));
+            }
+            self.tray_ctx_set = true;
+        }
+        if self.quit_requested {
+            self.quit_requested = false;
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.show_requested {
+            self.show_requested = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.tray_ok {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.log_push("Ventana oculta en la bandeja. Usa «Salir» en el icono para terminar.");
+        }
+        self.sync_tray();
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        paint_window_background(ui.ctx());
+        self.confirm_stop_modal(ui.ctx());
 
         let header_frame = egui::Frame::new()
-            .fill(SURFACE)
-            .inner_margin(egui::Margin::symmetric(12, 8))
-            .stroke(egui::Stroke::new(1.0, BORDER));
+            .fill(pal().surface)
+            .inner_margin(egui::Margin::symmetric(18, 12));
         egui::Panel::top("header")
             .frame(header_frame)
             .show(ui, |ui| self.header(ui));
 
         let max_log = ui.ctx().content_rect().width() * 0.55;
         let log_frame = egui::Frame::new()
-            .fill(SURFACE)
-            .inner_margin(egui::Margin::same(10))
-            .stroke(egui::Stroke::new(1.0, BORDER));
+            .fill(pal().surface)
+            .inner_margin(egui::Margin::same(16))
+            .corner_radius(18)
+            .stroke(egui::Stroke::new(1.0, pal().border))
+            .outer_margin(egui::Margin {
+                left: 0,
+                right: 12,
+                top: 12,
+                bottom: 12,
+            });
         egui::Panel::right("log")
             .resizable(true)
-            .default_size(360.0)
-            .min_size(240.0)
+            .default_size(380.0)
+            .min_size(260.0)
             .max_size(max_log)
             .frame(log_frame)
             .show(ui, |ui| self.log_panel(ui));
 
-        egui::CentralPanel::default().show(ui, |ui| self.body(ui));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin::symmetric(18, 16)),
+            )
+            .show(ui, |ui| self.body(ui));
     }
 }
 
@@ -2127,7 +3220,7 @@ fn usage() {
     );
     println!("  cinnamon-docker --help       esta ayuda");
     println!();
-    println!("Compose: {COMPOSE_FILE}");
+    println!("Compose: {}", compose_file());
 }
 
 fn main() -> eframe::Result<()> {
@@ -2143,12 +3236,14 @@ fn main() -> eframe::Result<()> {
 
     let (tx, rx) = channel();
     let app = App::new(tx, rx);
+    let theme = app.theme;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Docker Cinnamon")
             .with_inner_size([1320.0, 840.0])
-            .with_min_inner_size([980.0, 560.0]),
+            .with_min_inner_size([980.0, 560.0])
+            .with_icon(std::sync::Arc::new(app_icon())),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -2157,7 +3252,7 @@ fn main() -> eframe::Result<()> {
         "Docker Cinnamon",
         options,
         Box::new(move |cc| {
-            apply_theme(&cc.egui_ctx);
+            apply_theme(&cc.egui_ctx, theme);
             Ok(Box::new(app))
         }),
     )
@@ -2166,6 +3261,59 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rel_luminance(c: egui::Color32) -> f32 {
+        fn ch(v: u8) -> f32 {
+            let s = v as f32 / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
+        let (la, lb) = (rel_luminance(a), rel_luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn parsea_modo_de_tema() {
+        for (s, mode) in [
+            ("light", ThemeMode::Light),
+            (" claro ", ThemeMode::Light),
+            ("DARK", ThemeMode::Dark),
+            ("Oscuro", ThemeMode::Dark),
+        ] {
+            assert_eq!(ThemeMode::parse(s), Some(mode), "entrada: {s:?}");
+        }
+        for s in ["", "  ", "auto", "claro2", "gris"] {
+            assert_eq!(ThemeMode::parse(s), None, "entrada: {s:?}");
+        }
+    }
+
+    #[test]
+    fn key_hace_roundtrip() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            assert_eq!(ThemeMode::parse(mode.key()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn contraste_wcag_aa_en_ambos_temas() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let p = palette_for(mode);
+            for (nombre, color) in [("text", p.text), ("muted", p.muted)] {
+                let ratio = contrast_ratio(color, p.card);
+                assert!(
+                    ratio >= 4.5,
+                    "{nombre} sobre card en {mode:?}: {ratio:.2} < 4.5"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parsea_bytes_binarios_y_decimales() {
@@ -2201,8 +3349,64 @@ mod tests {
     }
 
     #[test]
+    fn icono_de_bandeja_128() {
+        let icon = tray_icon();
+        assert_eq!(icon.width, 128);
+        assert_eq!(icon.height, 128);
+        assert_eq!(icon.data.len(), 128 * 128 * 4);
+        // ARGB: esquina superior izquierda transparente; centro opaco.
+        assert_eq!(icon.data[0], 0);
+        let center = (64 * 128 + 64) * 4;
+        assert_eq!(icon.data[center], 255);
+        // Punto naranja arriba a la derecha.
+        let orange = (25 * 128 + 102) * 4;
+        assert_eq!(icon.data[orange], 255);
+        assert!(icon.data[orange + 1] > 150, "rojo del punto naranja");
+        assert_eq!(brand_rgba(128).len(), 65536);
+    }
+
+    #[test]
+    fn icono_de_ventana_128() {
+        let icon = app_icon();
+        assert_eq!((icon.width, icon.height), (128, 128));
+        assert_eq!(icon.rgba.len(), 65536);
+    }
+
+    #[test]
+    fn compose_file_resuelve_entorno() {
+        for vacio in [None, Some(""), Some("  ")] {
+            assert_eq!(resolve_compose_file(vacio), DEFAULT_COMPOSE_FILE);
+        }
+        assert_eq!(resolve_compose_file(Some("/tmp/x.yml")), "/tmp/x.yml");
+        assert_eq!(resolve_compose_file(Some(" /tmp/x.yml ")), "/tmp/x.yml");
+    }
+
+    #[test]
     fn bytes_humanos() {
         assert_eq!(human_bytes(583_113_113), "556 MiB");
         assert_eq!(human_bytes(16_707_422_781), "15.6 GiB");
+    }
+
+    #[test]
+    fn can_start_cinnamon_por_servicios() {
+        fn c(name: &str, state: &str) -> Container {
+            Container {
+                name: name.to_string(),
+                service: name.to_string(),
+                project: CINNAMON_PROJECT.to_string(),
+                state: state.to_string(),
+                ..Default::default()
+            }
+        }
+        assert!(can_start_project(CINNAMON_PROJECT, &[]));
+        let full: Vec<Container> = SERVICES.iter().map(|s| c(s, "running")).collect();
+        assert!(!can_start_project(CINNAMON_PROJECT, &full));
+        let mut stopped = full.clone();
+        stopped[0].state = "exited".to_string();
+        assert!(can_start_project(CINNAMON_PROJECT, &stopped));
+        let mut missing = full;
+        missing.pop();
+        assert!(can_start_project(CINNAMON_PROJECT, &missing));
+        assert!(!can_start_project("otro", &[]));
     }
 }

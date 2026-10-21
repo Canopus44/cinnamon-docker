@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Docker Cinnamon (simbólico)">
+  <defs>
+    <mask id="cut">
+      <rect width="512" height="512" fill="#000"/>
+      <g fill="#fff">
+        <path d="M369 323 L461 215 L445 323 L471 420 L369 369 Z"/>
+        <ellipse cx="235" cy="338" rx="154" ry="77"/>
+        <ellipse cx="179" cy="322" rx="67" ry="56"/>
+        <path d="M195 399 L246 471 L282 410 Z"/>
+      </g>
+      <g fill="#000">
+        <rect x="159" y="189" width="195" height="28" rx="14"/>
+        <rect x="159" y="230" width="195" height="28" rx="14"/>
+        <rect x="159" y="271" width="195" height="28" rx="14"/>
+        <circle cx="138" cy="317" r="11"/>
+      </g>
+    </mask>
+  </defs>
+  <rect width="512" height="512" fill="currentColor" mask="url(#cut)"/>
+</svg>

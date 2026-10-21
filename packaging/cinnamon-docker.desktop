@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Docker Cinnamon
+GenericName=Panel de Docker
+Comment=Panel de escritorio para Docker, compose y todos los contenedores
+Exec=cinnamon-docker
+Icon=cinnamon-docker
+Terminal=false
+Categories=Development;System;
+Keywords=docker;containers;compose;podman;
+StartupWMClass=cinnamon-docker
