@@ -94,6 +94,9 @@ cinnamon-docker
 
 - Elige tema claro/oscuro con el selector del header; queda guardado en
   `~/.config/cinnamon-docker/theme`.
+- Abre **Ajustes** para fijar la ruta del compose, el refresco (1–60 s), las
+  métricas (2–120 s) y el efecto 3D. Se guarda en
+  `~/.config/cinnamon-docker/settings.json`.
 - Cerrar la ventana la deja oculta en la bandeja; «Salir» en el menú del
   icono termina el proceso.
 - En KDE o GNOME con AppIndicator puedes comprobar que la bandeja existe:
@@ -123,10 +126,20 @@ requiere privilegios: por eso pide autenticación en cada arranque/parada. Con
 el usuario en el grupo `docker`, el resto de acciones (ps, stats, start/stop
 de contenedores, compose) no necesita privilegios.
 
-## 7. Compose de Cinnamon
+## 7. Compose y ajustes
 
-Por defecto la app usa la ruta del autor. Apunta la variable de entorno a tu
-compose:
+La vía recomendada es abrir **Ajustes** en el header y escribir la ruta del
+compose de Cinnamon. Se guarda en:
+
+```
+~/.config/cinnamon-docker/settings.json
+```
+
+El campo `compose` admite una ruta absoluta; si está vacío se usa
+`CINNAMON_DOCKER_COMPOSE` y, si tampoco existe, la ruta por defecto del autor.
+Cambiar la ruta no reinicia contenedores.
+
+También puedes fijar la variable de entorno antes de arrancar:
 
 ```bash
 export CINNAMON_DOCKER_COMPOSE="$HOME/proyectos/Cinnamon/docker-compose.yml"
@@ -139,7 +152,7 @@ shell. Verifica la ruta efectiva con:
 cinnamon-docker --help
 ```
 
-Se lee al arrancar; cambia la variable y vuelve a lanzar la app.
+La variable se lee al arrancar; para el resto de campos usa **Ajustes**.
 
 ## 8. Autostart opcional
 

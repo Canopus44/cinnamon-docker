@@ -1,7 +1,7 @@
 # Cómo funciona
 
 Documento técnico de `cinnamon-docker`. Todo el código vive en `src/main.rs`
-(~3400 líneas); el binario es único y no hay librería ni módulos. Dependencias:
+(~4200 líneas); el binario es único y no hay librería ni módulos. Dependencias:
 `eframe`/`egui` (UI), `serde_json` (salida de Docker) y `ksni` (bandeja SNI).
 
 ## Mapa de secciones
@@ -10,11 +10,11 @@ Documento técnico de `cinnamon-docker`. Todo el código vive en `src/main.rs`
 
 | Sección | Contenido |
 |---|---|
-| `tema` | `ThemeMode`, `Palette`, `LIGHT_PALETTE`/`DARK_PALETTE`, `CURRENT_MODE`, `pal()`, `theme_path`, `load_theme`/`save_theme`, `apply_theme`, `paint_window_background`, `theme_switch` y helpers (`tint`, `pill`, `dot_pill`, `meter`, `stat_text`, `soft_button`, `brand_mark`, `summary_card`, `clipped_label`). |
+| `tema` | `ThemeMode`, `Palette`, `LIGHT_PALETTE`/`DARK_PALETTE`, `CURRENT_MODE`, `pal()`, `theme_path`, `load_theme`/`save_theme`, `apply_theme`, `paint_window_background`, `theme_switch`, `Settings`, `parse_settings`, `load_settings`/`save_settings`, `settings_path`, `depth_surface`, `primary_button`, `paint_bevel`, `DEPTH_ENABLED` y helpers (`tint`, `pill`, `dot_pill`, `meter`, `stat_text`, `soft_button`, `brand_mark`, `summary_card`, `clipped_label`). |
 | `ejecución de comandos` | `CmdOut`, `run`, `run_merged`, `docker_bin`, `systemctl_bin`, `pkexec_bin`, `compose`, `engine_command`, `engine_active`, `socket_active`, `engine_hint`. |
 | `estado de los servicios y contenedores` | `SvcState`, `Container`, `read_containers` (`docker ps -a`), `health_from`, `services_from`, `state_of`, `is_ready`, `group_key`. |
 | `métricas (docker stats)` | `Stats`, `parse_pct`, `parse_bytes`, `read_stats`, `human_bytes`. |
-| `mensajes del hilo de trabajo` | `Notice`, `enum Msg`, `spawn_refresh`, `spawn_stats`, `engine_action`, `container_action`, `cinnamon_serial_start`, `wait_ready`, `group_start`, `group_stop`. |
+| `mensajes del hilo de trabajo` | `Notice`, `enum Msg`, `spawn_refresh`, `spawn_stats`, `engine_action`, `container_action`, `cinnamon_serial_start`, `wait_ready`, `group_start`, `group_stop`, `exec_action`, `EXEC_OUTPUT_LINES`, `EXEC_HISTORY`. |
 | `bandeja` | `TrayAction`, `TrayState`, `CinnamonTray`, `impl ksni::Tray`, `tray_icon`, `installed_icon_name`. |
 | `app` | `struct App`, `impl App` (drenaje, header, resumen, tarjetas, log, modal), `impl eframe::App` (`logic` y `ui`). |
 | `CLI` | `cli_status`, `cli_containers`, `usage`, `main`. |
@@ -26,6 +26,7 @@ main (UI egui: logic + ui)
  ├── spawn_refresh   cada 2 s   → docker ps -a + systemctl is-active + docker --version
  ├── spawn_stats     cada 5 s   → docker stats --no-stream (~2.1 s por muestra)
  ├── un hilo por acción        → engine_action / container_action / group_* / cinnamon_serial_start
+ ├── un hilo por comando de Consola → docker exec <id|name> sh -lc <comando>
  └── hilo ksni (SNI)           → D-Bus org.kde.StatusNotifierWatcher + menú
 ```
 
@@ -56,6 +57,7 @@ usa `async-io` internamente.
 | `EngineBusy(bool)` / `GlobalBusy(bool)` | Deshabilitan botones mientras dura la operación. |
 | `ContainerBusy { name, busy }` | Spinner por tarjeta. |
 | `Notice(Option<Notice>)` | Banner de éxito/error; un error puede traer el comando copiable. |
+| `ExecDone { target, command, output, ok, code }` | Añade una entrada al historial de Consola del contenedor (máx. 20), guarda el código de salida y libera su spinner. |
 | `ForceRefresh` | Fuerza un `spawn_refresh` inmediato tras una acción. |
 | `Tray(TrayAction)` | `Show`, `EngineStart`, `EngineStop`, `Refresh`, `StartProject(String)`, `StopProject(String)`, `Quit`. `EngineStop` muestra la ventana y abre el modal de confirmación; `Quit` marca `allow_close` y cierra. El String fija el proyecto del snapshot del menú, para que un cambio de selección entre abrir el menú y pulsar no arranque/apague otro proyecto. |
 
@@ -93,6 +95,12 @@ usa `async-io` internamente.
   aplica y guarda el cambio.
 - El icono de bandeja usa los mismos píxeles de marca (`brand_rgba`) que el
   header y la ventana, independientes del tema.
+- Ajustes persistentes: `settings.json` (compose efectivo, `refresh_secs`,
+  `stats_secs`, `depth`). Se cargan al arrancar; el modal sólo aplica al guardar.
+  Los números se recortan a 1–60 s y 2–120 s; JSON inválido cae en defaults.
+- `DEPTH_ENABLED: AtomicBool` controla el bisel/sombra de `depth_surface` y
+  `paint_bevel`. Los modales usan `pal().card` opaco para no dejar ver la UI de
+  atrás; el resto de paneles conserva `surface`.
 
 ## Bandeja SNI
 
@@ -127,12 +135,44 @@ contenedores. «Levantar cinnamon» usa `can_start_project`, que comprueba los 8
 
 ## Compose configurable
 
-`DEFAULT_COMPOSE_FILE` es la ruta del autor. `compose_file()` lee
-`CINNAMON_DOCKER_COMPOSE` una vez (`OnceLock`) y cae al default si la variable
-no existe o está vacía. `compose()` y `usage()` usan esa ruta; `--help` muestra
-la efectiva. No hay fallback silencioso a otra ruta si la variable apunta a un
-archivo inexistente. `compose()` ejecuta `docker compose -f <ruta> -p cinnamon …`,
-de modo que el nombre de proyecto no dependa del directorio del archivo.
+`DEFAULT_COMPOSE_FILE` es la ruta del autor. `default_compose()` resuelve
+`CINNAMON_DOCKER_COMPOSE` (o el default si falta o está vacía) y
+`COMPOSE_FILE: LazyLock<RwLock<String>>` guarda la ruta efectiva, mutable desde
+**Ajustes** con `set_compose_file`. `compose()` y `usage()` usan esa ruta;
+`--help` muestra la efectiva. No hay fallback silencioso a otra ruta si el
+valor apunta a un archivo inexistente. `compose()` ejecuta
+`docker compose -f <ruta> -p cinnamon …`, de modo que el nombre de proyecto no
+dependa del directorio del archivo.
+
+## Consola por contenedor
+
+`exec_action` corre en un hilo propio y ejecuta
+`docker exec <id|name> sh -lc <comando>`. El comando va como un único argv:
+no hay shell del host ni interpolación de variables locales. Dentro del
+contenedor `sh -lc` permite pipes, redirecciones y variables.
+
+- Sólo se ofrece para contenedores en marcha; el modal se abre desde el botón
+  **Consola** de la tarjeta.
+- `App` guarda el input por contenedor y un historial de 20 entradas
+  (`EXEC_HISTORY`), con salida recortada a las últimas 200 líneas
+  (`EXEC_OUTPUT_LINES`) para no crecer sin límite.
+- `ExecDone` trae `ok` y `code`; el modal pinta el estado y permite limpiar la
+  salida. Enter en el campo ejecuta (patrón `lost_focus && key_pressed(Enter)`);
+  también está el botón **Ejecutar**.
+- No hay TTY: los comandos interactivos no funcionan.
+- `run_merged_timeout` mata el proceso a los 60 s y `read_capped` limita cada
+  stream a 1 MiB; el recorte a 200 líneas se hace después.
+
+## Ajustes en runtime
+
+`Settings` (`compose`, `refresh_secs`, `stats_secs`, `depth`) se carga de
+`$XDG_CONFIG_HOME/cinnamon-docker/settings.json` al crear `App`. Al guardar:
+`set_compose_file` actualiza el `RwLock` que usa `compose()`, `set_depth_enabled`
+cambia el flag de dibujo y `save_settings` escribe JSON indentado. Un fallo de
+I/O no rompe la app.
+
+La ruta del compose se resuelve en cascada: campo `compose` no vacío →
+`CINNAMON_DOCKER_COMPOSE` → `DEFAULT_COMPOSE_FILE`. `--help` muestra la efectiva.
 
 ## Invariantes
 
@@ -151,6 +191,10 @@ de modo que el nombre de proyecto no dependa del directorio del archivo.
    desmapea y mantiene proceso, SNI y refresco. Sin bandeja, cierra normal.
 7. **El tema no afecta la lógica.** La paleta es sólo presentación; el icono de
    bandeja conserva el color de marca.
+8. **Consola sin shell del host.** `docker exec` recibe el comando como un solo
+   argumento; la única shell es `sh -lc` dentro del contenedor.
+9. **La consola no borra por sí sola.** La app no ejecuta `rm`/`down -v`; sólo
+   corre el comando que escribe el usuario.
 
 ## Merge de stats
 
@@ -178,3 +222,6 @@ en el resto, el nombre.
   el hilo de stats.
 - **Nueva acción de bandeja**: variante en `TrayAction`, ítem en `menu()` y rama
   en `drain`.
+- **Nuevo ajuste**: campo en `Settings`, parseo/guardado y control en el modal.
+- **Historial de consola**: `EXEC_HISTORY`/`EXEC_OUTPUT_LINES` y el mapa
+  `exec_entries`.

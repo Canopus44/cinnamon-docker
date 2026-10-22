@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,9 @@ const SERVICES: [&str; 8] = [
 
 const CINNAMON_PROJECT: &str = "cinnamon";
 const DEFAULT_COMPOSE_FILE: &str = "/mnt/disco-local/home/Github/Cinnamon/docker-compose.yml";
+const DEFAULT_REFRESH_SECS: u64 = 2;
+/// `docker stats --no-stream` tarda ~2 s: cadencia propia y en su hilo.
+const DEFAULT_STATS_SECS: u64 = 5;
 
 /// Valor no vacío de `CINNAMON_DOCKER_COMPOSE`, o la ruta por defecto.
 fn resolve_compose_file(value: Option<&str>) -> String {
@@ -37,20 +40,42 @@ fn resolve_compose_file(value: Option<&str>) -> String {
         .to_string()
 }
 
-fn compose_file() -> &'static str {
-    static FILE: OnceLock<String> = OnceLock::new();
-    FILE.get_or_init(|| {
-        let env = std::env::var("CINNAMON_DOCKER_COMPOSE").ok();
-        resolve_compose_file(env.as_deref())
-    })
+/// Compose por defecto: variable de entorno no vacía o la ruta del autor.
+fn default_compose() -> String {
+    resolve_compose_file(std::env::var("CINNAMON_DOCKER_COMPOSE").ok().as_deref())
 }
 
-const REFRESH_EVERY: Duration = Duration::from_secs(2);
-/// `docker stats --no-stream` tarda ~2 s: cadencia propia y en su hilo.
-const STATS_EVERY: Duration = Duration::from_secs(5);
+/// Ruta efectiva, mutable en runtime desde Ajustes. Se inicializa con el entorno.
+static COMPOSE_FILE: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(default_compose()));
+
+fn compose_file() -> String {
+    COMPOSE_FILE
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| default_compose())
+}
+
+/// Cambia la ruta efectiva usada por `compose()`. Vacío = valor por defecto.
+fn set_compose_file(value: &str) {
+    let next = if value.trim().is_empty() {
+        default_compose()
+    } else {
+        value.trim().to_string()
+    };
+    if let Ok(mut file) = COMPOSE_FILE.write() {
+        *file = next;
+    }
+}
+
 const WAIT_TIMEOUT: Duration = Duration::from_secs(900);
 const LOG_CAP: usize = 200;
 const LOGS_TAIL: usize = 200;
+const EXEC_OUTPUT_LINES: usize = 200;
+const EXEC_HISTORY: usize = 20;
+/// La consola no es un terminal: comandos interactivos o infinitos se cortan.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+/// Tope de bytes leídos por stream antes de recortar a líneas.
+const EXEC_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Binarios con ruta absoluta: el proceso GUI no siempre hereda el PATH del
 /// shell, y `pkexec`/`systemctl` sueltos fallaban sin mensaje útil.
@@ -171,6 +196,17 @@ const ICON_ORANGE: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x8A, 0x4A);
 /// paleta por cada función de dibujo. No hay otro hilo leyéndolo.
 static CURRENT_MODE: AtomicU8 = AtomicU8::new(0);
 
+/// El dibujo consulta este flag; Ajustes lo cambia en caliente.
+static DEPTH_ENABLED: AtomicBool = AtomicBool::new(true);
+
+fn depth_enabled() -> bool {
+    DEPTH_ENABLED.load(Ordering::Relaxed)
+}
+
+fn set_depth_enabled(on: bool) {
+    DEPTH_ENABLED.store(on, Ordering::Relaxed);
+}
+
 fn palette_for(mode: ThemeMode) -> &'static Palette {
     match mode {
         ThemeMode::Light => &LIGHT_PALETTE,
@@ -198,12 +234,24 @@ fn pal() -> &'static Palette {
     palette_for(current_mode())
 }
 
-fn theme_path() -> Option<PathBuf> {
+fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("cinnamon-docker").join("theme"))
+    Some(base.join("cinnamon-docker"))
+}
+
+fn config_path(name: &str) -> Option<PathBuf> {
+    config_dir().map(|d| d.join(name))
+}
+
+fn theme_path() -> Option<PathBuf> {
+    config_path("theme")
+}
+
+fn settings_path() -> Option<PathBuf> {
+    config_path("settings.json")
 }
 
 /// Preferencia guardada; cualquier error cae en el tema claro.
@@ -223,6 +271,73 @@ fn save_theme(mode: ThemeMode) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(path, mode.key());
+}
+
+/// Preferencia persistente (compose, cadencias y efecto 3D).
+#[derive(Clone, PartialEq)]
+struct Settings {
+    /// Ruta del compose de Cinnamon. Vacío = entorno o ruta del autor.
+    compose: String,
+    refresh_secs: u64,
+    stats_secs: u64,
+    /// Efecto 3D en botones y tarjetas.
+    depth: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            compose: String::new(),
+            refresh_secs: DEFAULT_REFRESH_SECS,
+            stats_secs: DEFAULT_STATS_SECS,
+            depth: true,
+        }
+    }
+}
+
+/// Parsea JSON sin fallar: campos ausentes o inválidos usan el valor por defecto.
+fn parse_settings(text: &str) -> Settings {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Settings::default();
+    };
+    let mut s = Settings::default();
+    if let Some(c) = v.get("compose").and_then(|x| x.as_str()) {
+        s.compose = c.trim().to_string();
+    }
+    if let Some(n) = v.get("refresh_secs").and_then(|x| x.as_u64()) {
+        s.refresh_secs = n.clamp(1, 60);
+    }
+    if let Some(n) = v.get("stats_secs").and_then(|x| x.as_u64()) {
+        s.stats_secs = n.clamp(2, 120);
+    }
+    if let Some(b) = v.get("depth").and_then(|x| x.as_bool()) {
+        s.depth = b;
+    }
+    s
+}
+
+fn load_settings() -> Settings {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| parse_settings(&t))
+        .unwrap_or_default()
+}
+
+/// Persiste sin ruido: un fallo de escritura no rompe la app.
+fn save_settings(s: &Settings) {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = serde_json::json!({
+        "compose": s.compose,
+        "refresh_secs": s.refresh_secs,
+        "stats_secs": s.stats_secs,
+        "depth": s.depth,
+    });
+    let _ = std::fs::write(path, format!("{body:#}\n"));
 }
 
 /// Mismo color con otra opacidad: fondos de pills y avisos.
@@ -469,30 +584,135 @@ fn dot_pill(ui: &mut egui::Ui, color: egui::Color32, text: &str) -> egui::Respon
         .response
 }
 
-/// Botón suave: fondo tintado, sin borde y radio completo. El padding se fija
-/// en un scope para no alterar el resto de la fila.
+/// Superficie con volumen falso: sombra proyectada, bisel claro arriba y borde
+/// oscuro abajo. Se apaga con `depth_enabled` (Ajustes → Efecto 3D).
+fn depth_surface(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: egui::Color32,
+    text: egui::Color32,
+    enabled: bool,
+    font_size: f32,
+) -> egui::Response {
+    let primary = font_size >= 12.0;
+    let padding = if primary {
+        egui::vec2(16.0, 8.0)
+    } else {
+        egui::vec2(9.0, 4.0)
+    };
+    let radius = if primary { 12u8 } else { 9u8 };
+    let min_height = if primary { 32.0 } else { 26.0 };
+    let font = egui::FontId::proportional(font_size);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, text);
+    let size = egui::vec2(
+        galley.size().x + padding.x * 2.0,
+        (galley.size().y + padding.y * 2.0).max(min_height),
+    );
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let response = if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let depth = depth_enabled() && enabled;
+    let lift = if depth && pressed { 1.0 } else { 0.0 };
+    let base = rect.translate(egui::vec2(0.0, lift));
+    let fill = if !enabled {
+        mix(pal().card, pal().muted, 0.10)
+    } else if hovered {
+        mix(fill, egui::Color32::WHITE, 0.08)
+    } else {
+        fill
+    };
+    let dark = current_mode() == ThemeMode::Dark;
+    let painter = ui.painter();
+    if depth {
+        painter.rect_filled(
+            rect.translate(egui::vec2(0.0, 3.0 - lift)),
+            radius,
+            tint(egui::Color32::BLACK, if dark { 110 } else { 26 }),
+        );
+    }
+    painter.rect_filled(base, radius, fill);
+    if depth {
+        let inset = radius as f32 * 0.8 + 2.0;
+        painter.line_segment(
+            [
+                egui::pos2(base.left() + inset, base.top() + 1.0),
+                egui::pos2(base.right() - inset, base.top() + 1.0),
+            ],
+            egui::Stroke::new(1.0, tint(egui::Color32::WHITE, if dark { 34 } else { 96 })),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(base.left() + inset, base.bottom() - 1.0),
+                egui::pos2(base.right() - inset, base.bottom() - 1.0),
+            ],
+            egui::Stroke::new(1.0, tint(egui::Color32::BLACK, if dark { 90 } else { 24 })),
+        );
+    }
+    painter.galley(base.center() - galley.size() / 2.0, galley, text);
+    response
+}
+
+/// Botón secundario tintado con el color semántico.
 fn soft_button(
     ui: &mut egui::Ui,
     label: &str,
     color: egui::Color32,
     enabled: bool,
 ) -> egui::Response {
-    let text =
-        egui::RichText::new(label)
-            .size(11.5)
-            .color(if enabled { color } else { pal().muted });
-    ui.scope(|ui| {
-        ui.spacing_mut().button_padding = egui::vec2(9.0, 4.0);
-        ui.add_enabled(
-            enabled,
-            egui::Button::new(text)
-                .fill(tint(color, if enabled { 18 } else { 8 }))
-                .stroke(egui::Stroke::NONE)
-                .corner_radius(255)
-                .min_size(egui::vec2(0.0, 26.0)),
-        )
-    })
-    .inner
+    let fill = if enabled {
+        mix(pal().card, color, 0.16)
+    } else {
+        mix(pal().card, pal().muted, 0.08)
+    };
+    depth_surface(
+        ui,
+        label,
+        fill,
+        if enabled { color } else { pal().muted },
+        enabled,
+        11.5,
+    )
+}
+
+/// Botón primario de acento.
+fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    depth_surface(ui, label, pal().accent, pal().on_accent, enabled, 12.5)
+}
+
+/// Bisel de tarjeta: línea clara arriba, oscura abajo. Sin efecto si el 3D está off.
+fn paint_bevel(painter: &egui::Painter, rect: egui::Rect, radius: f32) {
+    if !depth_enabled() {
+        return;
+    }
+    let inset = radius + 1.0;
+    if rect.width() <= inset * 2.0 {
+        return;
+    }
+    let dark = current_mode() == ThemeMode::Dark;
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + inset, rect.top() + 1.0),
+            egui::pos2(rect.right() - inset, rect.top() + 1.0),
+        ],
+        egui::Stroke::new(1.0, tint(egui::Color32::WHITE, if dark { 24 } else { 140 })),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + inset, rect.bottom() - 1.0),
+            egui::pos2(rect.right() - inset, rect.bottom() - 1.0),
+        ],
+        egui::Stroke::new(1.0, tint(egui::Color32::BLACK, if dark { 80 } else { 22 })),
+    );
 }
 
 /// Marca de la app: los mismos píxeles que el icono de bandeja y de ventana.
@@ -519,7 +739,7 @@ fn summary_card(ui: &mut egui::Ui, label: &str, value: &str, detail: &str) {
     } else {
         26.0
     };
-    egui::Frame::new()
+    let card = egui::Frame::new()
         .fill(pal().card)
         .corner_radius(20)
         .inner_margin(egui::Margin::same(16))
@@ -543,12 +763,14 @@ fn summary_card(ui: &mut egui::Ui, label: &str, value: &str, detail: &str) {
             ui.add_space(2.0);
             ui.label(egui::RichText::new(detail).size(11.0).color(pal().muted));
         });
+    paint_bevel(ui.painter(), card.response.rect, 20.0);
 }
 
 // ── ejecución de comandos ───────────────────────────────────────────────────
 
 struct CmdOut {
     ok: bool,
+    code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -581,11 +803,13 @@ fn run(program: &str, args: &[&str]) -> CmdOut {
     {
         Ok(o) => CmdOut {
             ok: o.status.success(),
+            code: o.status.code(),
             stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
         },
         Err(e) => CmdOut {
             ok: false,
+            code: None,
             stdout: String::new(),
             stderr: format!("no se pudo ejecutar `{program}`: {e}"),
         },
@@ -606,6 +830,7 @@ fn run_merged(program: &str, args: &[&str]) -> CmdOut {
         Err(e) => {
             return CmdOut {
                 ok: false,
+                code: None,
                 stdout: String::new(),
                 stderr: format!("no se pudo ejecutar `{program}`: {e}"),
             }
@@ -627,8 +852,90 @@ fn run_merged(program: &str, args: &[&str]) -> CmdOut {
     if let Some(h) = handle {
         stderr = h.join().unwrap_or_default();
     }
-    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-    CmdOut { ok, stdout, stderr }
+    let status = child.wait().ok();
+    let ok = status.as_ref().is_some_and(|s| s.success());
+    let code = status.and_then(|s| s.code());
+    CmdOut {
+        ok,
+        code,
+        stdout,
+        stderr,
+    }
+}
+
+/// Lee un pipe con tope para que un comando ruidoso no agote la memoria.
+fn read_capped(pipe: impl Read) -> String {
+    let mut buf = Vec::new();
+    let _ = pipe.take(EXEC_MAX_BYTES).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Como `run_merged`, pero mata el proceso al vencer `timeout`. Se usa en la
+/// consola: sin TTY, `tail -f` o `sleep` dejarían el modal bloqueado.
+fn run_merged_timeout(program: &str, args: &[&str], timeout: Duration) -> CmdOut {
+    let child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return CmdOut {
+                ok: false,
+                code: None,
+                stdout: String::new(),
+                stderr: format!("no se pudo ejecutar `{program}`: {e}"),
+            }
+        }
+    };
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let out_handle = out_pipe.map(|p| thread::spawn(move || read_capped(p)));
+    let err_handle = err_pipe.map(|p| thread::spawn(move || read_capped(p)));
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut timed_out = false;
+    let mut wait_error = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                status = Some(s);
+                break;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                timed_out = true;
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(e) => {
+                wait_error = Some(e.to_string());
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    let stdout = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let mut stderr = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    if timed_out {
+        stderr.push_str(&format!(
+            "\n[docker exec interrumpido tras {} s]",
+            timeout.as_secs()
+        ));
+    } else if let Some(ref e) = wait_error {
+        stderr.push_str(&format!("\n[docker exec: {e}]"));
+    }
+    let ok = !timed_out && wait_error.is_none() && status.as_ref().is_some_and(|s| s.success());
+    CmdOut {
+        ok,
+        code: status.and_then(|s| s.code()),
+        stdout,
+        stderr,
+    }
 }
 
 fn cmdline(program: &str, args: &[String]) -> String {
@@ -668,7 +975,8 @@ fn pkexec_bin() -> Option<&'static str> {
 }
 
 fn compose(args: &[&str]) -> CmdOut {
-    let mut full = vec!["compose", "-f", compose_file(), "-p", CINNAMON_PROJECT];
+    let file = compose_file();
+    let mut full: Vec<&str> = vec!["compose", "-f", file.as_str(), "-p", CINNAMON_PROJECT];
     full.extend_from_slice(args);
     run(docker_bin(), &full)
 }
@@ -1017,6 +1325,14 @@ struct Notice {
     error: bool,
 }
 
+#[derive(Clone)]
+struct ExecEntry {
+    command: String,
+    output: String,
+    ok: bool,
+    code: Option<i32>,
+}
+
 enum Msg {
     Refresh {
         active: bool,
@@ -1038,6 +1354,13 @@ enum Msg {
     Stats {
         rows: HashMap<String, Stats>,
         error: Option<String>,
+    },
+    ExecDone {
+        target: String,
+        command: String,
+        output: String,
+        ok: bool,
+        code: Option<i32>,
     },
 }
 
@@ -1275,6 +1598,41 @@ fn container_action(tx: Sender<Msg>, c: Container, op: ContainerOp) {
             busy: false,
         });
         let _ = tx.send(Msg::ForceRefresh);
+    });
+}
+
+/// Cola de salida: conserva el final, que es donde está el error útil.
+fn clip_tail(text: &str, max: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let omitted = lines.len() - keep;
+    format!(
+        "… ({omitted} líneas omitidas)\n{}",
+        lines[lines.len() - keep..].join("\n")
+    )
+}
+
+/// `docker exec` recibe el comando como un único argumento: no hay shell del
+/// host ni interpolación. Dentro del contenedor se usa `sh -lc` para permitir
+/// pipes, redirecciones y variables.
+fn exec_action(tx: Sender<Msg>, target: String, name: String, command: String) {
+    thread::spawn(move || {
+        let out = run_merged_timeout(
+            docker_bin(),
+            &["exec", target.as_str(), "sh", "-lc", command.as_str()],
+            EXEC_TIMEOUT,
+        );
+        let output = clip_tail(&out.full_output(), EXEC_OUTPUT_LINES);
+        let _ = tx.send(Msg::ExecDone {
+            target: name,
+            command,
+            output,
+            ok: out.ok,
+            code: out.code,
+        });
     });
 }
 
@@ -1812,6 +2170,9 @@ struct App {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     theme: ThemeMode,
+    settings: Settings,
+    settings_open: bool,
+    settings_draft: Settings,
     engine_active: Option<bool>,
     socket_active: Option<bool>,
     docker_version: String,
@@ -1820,6 +2181,10 @@ struct App {
     engine_busy: bool,
     global_busy: bool,
     busy_containers: HashSet<String>,
+    exec_target: Option<String>,
+    exec_inputs: HashMap<String, String>,
+    exec_entries: HashMap<String, VecDeque<ExecEntry>>,
+    exec_busy: HashSet<String>,
     refreshing: bool,
     last_refresh: Instant,
     compose_error: Option<String>,
@@ -1852,25 +2217,27 @@ fn engine_buttons(
     let mut start = false;
     let mut stop = false;
     let mut refresh = false;
-    if ui.button("Refrescar").clicked() {
+    if soft_button(ui, "Refrescar", pal().muted, true).clicked() {
         refresh = true;
     }
     let idle = !busy;
-    if ui
-        .add_enabled(
-            idle && (active == Some(true) || socket == Some(true)),
-            egui::Button::new("Detener motor"),
-        )
-        .clicked()
+    if soft_button(
+        ui,
+        "Detener motor",
+        pal().err,
+        idle && (active == Some(true) || socket == Some(true)),
+    )
+    .clicked()
     {
         stop = true;
     }
-    if ui
-        .add_enabled(
-            idle && active != Some(true),
-            egui::Button::new("Iniciar motor"),
-        )
-        .clicked()
+    if soft_button(
+        ui,
+        "Iniciar motor",
+        pal().accent,
+        idle && active != Some(true),
+    )
+    .clicked()
     {
         start = true;
     }
@@ -1889,6 +2256,11 @@ impl App {
     fn new(tx: Sender<Msg>, rx: Receiver<Msg>) -> Self {
         let theme = load_theme();
         set_current_mode(theme);
+        let mut settings = load_settings();
+        set_compose_file(&settings.compose);
+        set_depth_enabled(settings.depth);
+        settings.compose = compose_file();
+        let settings_draft = settings.clone();
         let tray_state = Arc::new(Mutex::new(TrayState::default()));
         let tray = CinnamonTray {
             tx: tx.clone(),
@@ -1903,6 +2275,9 @@ impl App {
             tx,
             rx,
             theme,
+            settings,
+            settings_open: false,
+            settings_draft,
             engine_active: None,
             socket_active: None,
             docker_version: String::new(),
@@ -1911,6 +2286,10 @@ impl App {
             engine_busy: false,
             global_busy: false,
             busy_containers: HashSet::new(),
+            exec_target: None,
+            exec_inputs: HashMap::new(),
+            exec_entries: HashMap::new(),
+            exec_busy: HashSet::new(),
             refreshing: true,
             last_refresh: Instant::now(),
             compose_error: None,
@@ -1930,7 +2309,10 @@ impl App {
             quit_requested: false,
         };
         spawn_refresh(app.tx.clone());
-        app.log_push("Panel listo. Refresco automático cada 2s.");
+        app.log_push(format!(
+            "Panel listo. Refresco automático cada {}s.",
+            app.settings.refresh_secs
+        ));
         match tray_err {
             Some(e) => app.log_push(format!("Bandeja no disponible: {e}")),
             None => app.log_push("Bandeja: icono registrado (SNI)."),
@@ -1959,6 +2341,177 @@ impl App {
         apply_theme(ctx, mode);
         save_theme(mode);
         self.log_push(format!("Tema: {}", mode.label()));
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_draft = self.settings.clone();
+        self.settings_open = true;
+    }
+
+    fn settings_modal(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut draft = self.settings_draft.clone();
+        let mut save = false;
+        let mut cancel = false;
+        let mut reset = false;
+        let file_hint = settings_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "sin HOME/XDG_CONFIG_HOME".to_string());
+        let effective = compose_file();
+        let frame = egui::Frame::new()
+            .fill(pal().card)
+            .corner_radius(22)
+            .inner_margin(egui::Margin::same(18))
+            .stroke(egui::Stroke::new(1.0, pal().border))
+            .shadow(egui::Shadow {
+                offset: [0, 12],
+                blur: 36,
+                spread: 0,
+                color: pal().card_shadow,
+            });
+        egui::Modal::new(egui::Id::unique("settings_modal"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_max_width(620.0);
+                ui.label(
+                    egui::RichText::new("Ajustes")
+                        .size(20.0)
+                        .strong()
+                        .color(pal().text),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Se guardan en {file_hint}"))
+                        .size(11.0)
+                        .monospace()
+                        .color(pal().muted),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("Compose del stack Cinnamon")
+                        .size(12.0)
+                        .strong()
+                        .color(pal().text),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.compose)
+                        .hint_text(default_compose())
+                        .desired_width(ui.available_width()),
+                );
+                ui.label(
+                    egui::RichText::new("Se usa al levantar Cinnamon. Vacío = valor por defecto.")
+                        .size(11.0)
+                        .color(pal().muted),
+                );
+                let typed = draft.compose.trim();
+                if !typed.is_empty() && !Path::new(typed).exists() {
+                    ui.label(
+                        egui::RichText::new("Aviso: esa ruta no existe todavía.")
+                            .size(11.0)
+                            .color(pal().warn),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!("Ruta efectiva ahora: {effective}"))
+                        .size(11.0)
+                        .monospace()
+                        .color(pal().muted),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Refresco de contenedores")
+                            .size(12.0)
+                            .color(pal().text),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut draft.refresh_secs)
+                            .range(1..=60)
+                            .suffix(" s"),
+                    );
+                    ui.label(
+                        egui::RichText::new("docker ps -a")
+                            .size(11.0)
+                            .color(pal().muted),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Métricas de CPU/RAM")
+                            .size(12.0)
+                            .color(pal().text),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut draft.stats_secs)
+                            .range(2..=120)
+                            .suffix(" s"),
+                    );
+                    ui.label(
+                        egui::RichText::new("docker stats --no-stream")
+                            .size(11.0)
+                            .color(pal().muted),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut draft.depth,
+                    egui::RichText::new("Efecto 3D en botones y tarjetas").size(12.0),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, "Guardar cambios", true).clicked() {
+                        save = true;
+                    }
+                    if soft_button(ui, "Cancelar", pal().muted, true).clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if soft_button(ui, "Restaurar", pal().muted, true)
+                            .on_hover_text("Ruta, cadencias y efecto 3D por defecto")
+                            .clicked()
+                        {
+                            reset = true;
+                        }
+                    });
+                });
+            });
+
+        if reset {
+            draft = Settings {
+                compose: default_compose(),
+                ..Settings::default()
+            };
+        }
+        if save {
+            set_compose_file(&draft.compose);
+            let saved = Settings {
+                compose: draft.compose.trim().to_string(),
+                refresh_secs: draft.refresh_secs.clamp(1, 60),
+                stats_secs: draft.stats_secs.clamp(2, 120),
+                depth: draft.depth,
+            };
+            set_depth_enabled(saved.depth);
+            save_settings(&saved);
+            self.settings = saved;
+            self.settings_open = false;
+            self.log_push(format!(
+                "Ajustes guardados · refresco {}s · stats {}s · 3D {}",
+                self.settings.refresh_secs,
+                self.settings.stats_secs,
+                if self.settings.depth { "on" } else { "off" }
+            ));
+            // Adelanta el próximo ciclo para aplicar la cadencia nueva ya.
+            self.last_refresh = Instant::now()
+                .checked_sub(Duration::from_secs(self.settings.refresh_secs))
+                .unwrap_or_else(Instant::now);
+            return;
+        }
+        if cancel {
+            self.settings_open = false;
+            return;
+        }
+        self.settings_draft = draft;
     }
 
     fn drain(&mut self) {
@@ -2029,6 +2582,27 @@ impl App {
                         spawn_refresh(self.tx.clone());
                     }
                 }
+                Msg::ExecDone {
+                    target,
+                    command,
+                    output,
+                    ok,
+                    code,
+                } => {
+                    self.exec_busy.remove(&target);
+                    let verb = if ok { "✔" } else { "✖" };
+                    self.log_push(format!("{verb} {target}: docker exec … {command:?}"));
+                    let entries = self.exec_entries.entry(target.clone()).or_default();
+                    entries.push_back(ExecEntry {
+                        command,
+                        output,
+                        ok,
+                        code,
+                    });
+                    while entries.len() > EXEC_HISTORY {
+                        entries.pop_front();
+                    }
+                }
                 Msg::Tray(action) => match action {
                     TrayAction::Show => self.show_requested = true,
                     TrayAction::EngineStart => {
@@ -2076,6 +2650,14 @@ impl App {
             *s = next;
         }
         handle.update(|_| ());
+    }
+
+    fn refresh_every(&self) -> Duration {
+        Duration::from_secs(self.settings.refresh_secs.max(1))
+    }
+
+    fn stats_every(&self) -> Duration {
+        Duration::from_secs(self.settings.stats_secs.max(2))
     }
 
     fn request_refresh(&mut self) {
@@ -2198,6 +2780,7 @@ impl App {
         let mut do_start_selected = false;
         let mut do_stop_selected = false;
         let mut theme_req = None;
+        let mut open_settings = false;
         let narrow = ui.available_width() < 1100.0;
         let (active, socket, engine_busy) =
             (self.engine_active, self.socket_active, self.engine_busy);
@@ -2245,6 +2828,12 @@ impl App {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 theme_req = theme_switch(ui, theme);
+                if soft_button(ui, "Ajustes", pal().muted, true)
+                    .on_hover_text("Compose, cadencias y efecto 3D")
+                    .clicked()
+                {
+                    open_settings = true;
+                }
                 if !narrow {
                     let (s, p, r) = engine_buttons(ui, active, socket, engine_busy);
                     do_start |= s;
@@ -2276,6 +2865,9 @@ impl App {
         if let Some(mode) = theme_req {
             self.set_theme(ui.ctx(), mode);
         }
+        if open_settings {
+            self.open_settings();
+        }
 
         // Bloque 2: selector de proyecto y acciones sobre el grupo elegido.
         ui.add_space(10.0);
@@ -2305,27 +2897,8 @@ impl App {
                                 ui.selectable_value(&mut selected, p.clone(), group_key(p));
                             }
                         });
-                    let primary = ui
-                        .scope(|ui| {
-                            ui.spacing_mut().button_padding = egui::vec2(16.0, 8.0);
-                            ui.add_enabled(
-                                can_start,
-                                egui::Button::new(
-                                    egui::RichText::new(format!(
-                                        "Levantar {}",
-                                        group_key(&selected)
-                                    ))
-                                    .size(12.5)
-                                    .color(pal().on_accent)
-                                    .strong(),
-                                )
-                                .fill(pal().accent)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(12),
-                            )
-                        })
-                        .inner;
-                    if primary
+                    let start_label = format!("Levantar {}", group_key(&selected));
+                    if primary_button(ui, &start_label, can_start)
                         .on_hover_text(if selected == CINNAMON_PROJECT {
                             "Arranque en serie con espera healthy"
                         } else {
@@ -2335,18 +2908,8 @@ impl App {
                     {
                         do_start_selected = true;
                     }
-                    if ui
-                        .add_enabled(
-                            can_stop,
-                            egui::Button::new(
-                                egui::RichText::new(format!("Apagar {}", group_key(&selected)))
-                                    .size(12.5)
-                                    .color(if can_stop { pal().err } else { pal().muted }),
-                            )
-                            .fill(tint(pal().err, if can_stop { 18 } else { 8 }))
-                            .stroke(egui::Stroke::NONE)
-                            .corner_radius(12),
-                        )
+                    let stop_label = format!("Apagar {}", group_key(&selected));
+                    if soft_button(ui, &stop_label, pal().err, can_stop)
                         .on_hover_text("Detiene los contenedores en marcha de este proyecto")
                         .clicked()
                     {
@@ -2408,7 +2971,7 @@ impl App {
         }
         let mut choice: Option<bool> = None;
         let frame = egui::Frame::new()
-            .fill(pal().surface)
+            .fill(pal().card)
             .corner_radius(20)
             .inner_margin(egui::Margin::same(18))
             .stroke(egui::Stroke::new(1.0, pal().border))
@@ -2475,11 +3038,199 @@ impl App {
         }
     }
 
+    fn exec_modal(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.exec_target.clone() else {
+            return;
+        };
+        let Some(c) = self.containers.iter().find(|c| c.name == name).cloned() else {
+            self.exec_target = None;
+            return;
+        };
+        let mut input = self.exec_inputs.get(&name).cloned().unwrap_or_default();
+        let busy = self.exec_busy.contains(&name);
+        let entries: Vec<ExecEntry> = self
+            .exec_entries
+            .get(&name)
+            .map(|e| e.iter().cloned().collect())
+            .unwrap_or_default();
+        let running = c.state == "running";
+        let mut run = false;
+        let mut close = false;
+        let mut clear = false;
+
+        let frame = egui::Frame::new()
+            .fill(pal().card)
+            .corner_radius(22)
+            .inner_margin(egui::Margin::same(18))
+            .stroke(egui::Stroke::new(1.0, pal().border))
+            .shadow(egui::Shadow {
+                offset: [0, 12],
+                blur: 36,
+                spread: 0,
+                color: pal().card_shadow,
+            });
+        egui::Modal::new(egui::Id::unique("exec_modal"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_max_width(760.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Consola")
+                            .size(20.0)
+                            .strong()
+                            .color(pal().text),
+                    );
+                    ui.label(
+                        egui::RichText::new(&name)
+                            .monospace()
+                            .size(13.0)
+                            .color(pal().accent),
+                    );
+                    pill(
+                        ui,
+                        if running { "running" } else { c.state.as_str() },
+                        if running { pal().ok } else { pal().err },
+                    );
+                    if !c.service.is_empty() {
+                        pill(ui, c.service.clone(), pal().info);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "docker exec <contenedor> sh -lc · no usa el shell del host",
+                    )
+                    .size(11.0)
+                    .color(pal().muted),
+                );
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(tint(pal().muted, 8))
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_min_height(150.0);
+                        egui::ScrollArea::vertical()
+                            .stick_to_bottom(true)
+                            .max_height(300.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                if entries.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Sin comandos todavía. Escribe abajo y pulsa Ejecutar.",
+                                        )
+                                        .size(11.5)
+                                        .color(pal().muted),
+                                    );
+                                }
+                                for e in &entries {
+                                    ui.label(
+                                        egui::RichText::new(format!("$ {}", e.command))
+                                            .monospace()
+                                            .size(11.5)
+                                            .strong()
+                                            .color(pal().accent),
+                                    );
+                                    if !e.output.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&e.output)
+                                                .monospace()
+                                                .size(11.5)
+                                                .color(if e.ok { pal().text } else { pal().err }),
+                                        );
+                                    }
+                                    let code = e
+                                        .code
+                                        .map(|c| format!("código {c}"))
+                                        .unwrap_or_else(|| {
+                                            if e.ok {
+                                                "ok".to_string()
+                                            } else {
+                                                "falló".to_string()
+                                            }
+                                        });
+                                    ui.label(egui::RichText::new(code).size(10.0).color(if e.ok {
+                                        pal().muted
+                                    } else {
+                                        pal().err
+                                    }));
+                                    ui.add_space(6.0);
+                                }
+                            });
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if busy {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("ejecutando…")
+                                .size(11.0)
+                                .color(pal().muted),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if soft_button(ui, "Cerrar", pal().muted, true).clicked() {
+                            close = true;
+                        }
+                        if soft_button(ui, "Limpiar salida", pal().muted, !entries.is_empty())
+                            .clicked()
+                        {
+                            clear = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                let hint = if running {
+                    "p. ej. ls -la /app · env · cat /etc/os-release"
+                } else {
+                    "El contenedor no está en marcha"
+                };
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - 110.0).max(160.0);
+                    let resp = ui.add_enabled(
+                        running && !busy,
+                        egui::TextEdit::singleline(&mut input)
+                            .hint_text(hint)
+                            .desired_width(width),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        run = true;
+                    }
+                    if primary_button(ui, "Ejecutar", running && !busy && !input.trim().is_empty())
+                        .clicked()
+                    {
+                        run = true;
+                    }
+                });
+            });
+
+        let cmd = input.trim().to_string();
+        self.exec_inputs.insert(name.clone(), input);
+        if clear {
+            self.exec_entries.remove(&name);
+        }
+        if close {
+            self.exec_target = None;
+        }
+        if run && running && !busy && !cmd.is_empty() {
+            self.exec_busy.insert(name.clone());
+            self.exec_inputs.insert(name.clone(), String::new());
+            let target = if c.id.is_empty() {
+                c.name.clone()
+            } else {
+                c.id.clone()
+            };
+            exec_action(self.tx.clone(), target, name, cmd);
+        }
+    }
+
     fn body(&mut self, ui: &mut egui::Ui) {
         let containers = self.containers.clone();
         let mut req_group_start: Option<(String, Vec<Container>)> = None;
         let mut req_group_stop: Option<(String, Vec<Container>)> = None;
         let mut container_action_req: Option<(Container, ContainerOp)> = None;
+        let mut exec_request: Option<Container> = None;
 
         if let Some(notice) = self.notice.clone() {
             let color = if notice.error { pal().err } else { pal().ok };
@@ -2596,7 +3347,7 @@ impl App {
                 if containers.is_empty() {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
-                        egui::Frame::new()
+                        let card = egui::Frame::new()
                             .fill(pal().card)
                             .stroke(egui::Stroke::new(1.0, pal().border))
                             .corner_radius(18)
@@ -2618,6 +3369,7 @@ impl App {
                                     );
                                 });
                             });
+                        paint_bevel(ui.painter(), card.response.rect, 18.0);
                     });
                 }
 
@@ -2712,7 +3464,7 @@ impl App {
                         // En tarjetas estrechas la pill de servicio no cabe sin
                         // solaparse con las acciones: el nombre ya la contiene.
                         let compact = ui.available_width() < 620.0;
-                        egui::Frame::new()
+                        let card = egui::Frame::new()
                             .fill(pal().card)
                             .stroke(egui::Stroke::new(1.0, pal().border))
                             .corner_radius(18)
@@ -2774,6 +3526,19 @@ impl App {
                                         |ui| {
                                             if busy {
                                                 ui.spinner();
+                                            }
+                                            if soft_button(
+                                                ui,
+                                                "Consola",
+                                                pal().accent,
+                                                !busy && c.state == "running",
+                                            )
+                                            .on_hover_text(
+                                                "Ejecutar comandos dentro del contenedor con docker exec",
+                                            )
+                                            .clicked()
+                                            {
+                                                exec_request = Some(c.clone());
                                             }
                                             if soft_button(ui, "Logs", pal().muted, !blocked)
                                                 .clicked()
@@ -2901,6 +3666,7 @@ impl App {
                                     );
                                 });
                             });
+                        paint_bevel(ui.painter(), card.response.rect, 18.0);
                         ui.add_space(10.0);
                     }
                 }
@@ -2917,6 +3683,10 @@ impl App {
         if let Some((c, op)) = container_action_req {
             self.busy_containers.insert(c.name.clone());
             container_action(self.tx.clone(), c, op);
+        }
+        if let Some(c) = exec_request {
+            self.exec_target = Some(c.name.clone());
+            self.exec_inputs.entry(c.name.clone()).or_default();
         }
     }
 
@@ -3012,12 +3782,14 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
 
-        if !self.refreshing && self.last_refresh.elapsed() >= REFRESH_EVERY {
+        if !self.refreshing && self.last_refresh.elapsed() >= self.refresh_every() {
             self.request_refresh();
         }
         if self.engine_active == Some(true)
             && !self.stats_refreshing
-            && self.stats_at.is_none_or(|t| t.elapsed() >= STATS_EVERY)
+            && self
+                .stats_at
+                .is_none_or(|t| t.elapsed() >= self.stats_every())
         {
             self.stats_refreshing = true;
             spawn_stats(self.tx.clone());
@@ -3051,13 +3823,23 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         paint_window_background(ui.ctx());
         self.confirm_stop_modal(ui.ctx());
+        self.exec_modal(ui.ctx());
+        self.settings_modal(ui.ctx());
 
         let header_frame = egui::Frame::new()
             .fill(pal().surface)
             .inner_margin(egui::Margin::symmetric(18, 12));
-        egui::Panel::top("header")
+        let header = egui::Panel::top("header")
             .frame(header_frame)
             .show(ui, |ui| self.header(ui));
+        let hb = header.response.rect;
+        ui.painter().line_segment(
+            [
+                egui::pos2(hb.left(), hb.bottom()),
+                egui::pos2(hb.right(), hb.bottom()),
+            ],
+            egui::Stroke::new(1.0, pal().border),
+        );
 
         let max_log = ui.ctx().content_rect().width() * 0.55;
         let log_frame = egui::Frame::new()
@@ -3071,13 +3853,14 @@ impl eframe::App for App {
                 top: 12,
                 bottom: 12,
             });
-        egui::Panel::right("log")
+        let log_panel = egui::Panel::right("log")
             .resizable(true)
             .default_size(380.0)
             .min_size(260.0)
             .max_size(max_log)
             .frame(log_frame)
             .show(ui, |ui| self.log_panel(ui));
+        paint_bevel(ui.painter(), log_panel.response.rect.shrink(1.0), 18.0);
 
         egui::CentralPanel::default()
             .frame(
@@ -3224,6 +4007,7 @@ fn usage() {
 }
 
 fn main() -> eframe::Result<()> {
+    set_compose_file(&load_settings().compose);
     match std::env::args().nth(1).as_deref() {
         Some("--status") | Some("-s") => std::process::exit(cli_status()),
         Some("--containers") | Some("-c") => std::process::exit(cli_containers()),
@@ -3277,6 +4061,38 @@ mod tests {
     fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
         let (la, lb) = (rel_luminance(a), rel_luminance(b));
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn parsea_settings_con_defaults_y_limites() {
+        let s = parse_settings("{}");
+        assert_eq!(s.refresh_secs, DEFAULT_REFRESH_SECS);
+        assert_eq!(s.stats_secs, DEFAULT_STATS_SECS);
+        assert_eq!(s.compose, "");
+
+        let s = parse_settings(r#"{"compose":" /tmp/x.yml ","refresh_secs":0,"stats_secs":999}"#);
+        assert_eq!(s.compose, "/tmp/x.yml");
+        assert_eq!(s.refresh_secs, 1);
+        assert_eq!(s.stats_secs, 120);
+
+        let s = parse_settings("no-json");
+        assert_eq!(s.refresh_secs, DEFAULT_REFRESH_SECS);
+    }
+
+    #[test]
+    fn toggle_efecto_3d() {
+        let previo = depth_enabled();
+        set_depth_enabled(false);
+        assert!(!depth_enabled());
+        set_depth_enabled(true);
+        assert!(depth_enabled());
+        set_depth_enabled(previo);
+    }
+
+    #[test]
+    fn settings_depth_por_defecto_y_json() {
+        assert!(Settings::default().depth);
+        assert!(!parse_settings(r#"{"depth":false}"#).depth);
     }
 
     #[test]
@@ -3408,5 +4224,81 @@ mod tests {
         missing.pop();
         assert!(can_start_project(CINNAMON_PROJECT, &missing));
         assert!(!can_start_project("otro", &[]));
+    }
+
+    #[test]
+    fn recorta_salida_larga() {
+        let text = (0..5)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(clip_tail(&text, 10), text);
+        let clipped = clip_tail(&text, 2);
+        assert!(clipped.starts_with("… (4 líneas omitidas)"));
+        assert!(!clipped.contains("l3"));
+        assert!(clipped.ends_with("l4"));
+        assert_eq!(clipped.lines().count(), 2);
+    }
+
+    #[test]
+    fn exec_con_timeout_mata_y_avisa() {
+        let out = run_merged_timeout("/bin/sh", &["-c", "sleep 5"], Duration::from_millis(120));
+        assert!(!out.ok);
+        assert!(out.stderr.contains("interrumpido tras"));
+    }
+
+    #[test]
+    fn exec_devuelve_codigo_y_salida() {
+        let out = run_merged_timeout(
+            "/bin/sh",
+            &["-c", "printf hola; exit 3"],
+            Duration::from_secs(2),
+        );
+        assert_eq!(out.stdout, "hola");
+        assert_eq!(out.code, Some(3));
+        assert!(!out.ok);
+    }
+
+    #[test]
+    fn enter_en_textedit_singleline_desenfoca_y_se_detecta() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("test_consola_input");
+        let mut input = String::new();
+        let mut enter_detectado = false;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        // Frame 1: el campo pide el foco.
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        ctx.run_ui(raw, |ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut input).id(id));
+            resp.request_focus();
+        })
+        .drop_without_applying_deltas();
+
+        // Frame 2: llega Enter; el TextEdit de una línea pierde el foco.
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        ctx.run_ui(raw, |ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut input).id(id));
+            enter_detectado = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        })
+        .drop_without_applying_deltas();
+
+        assert!(
+            enter_detectado,
+            "Enter en TextEdit singleline debe perder foco y marcar key_pressed"
+        );
     }
 }

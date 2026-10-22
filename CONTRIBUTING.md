@@ -61,8 +61,10 @@ los sustituyas por validaciones inventadas.
 - No uses `unwrap()`/`expect()` en rutas que ejecuta la UI (comandos, parseo de
   salida de Docker, pintado). En tests y constantes sí es aceptable.
 - Añade un test cuando toques parseo (`parse_pct`, `parse_bytes`,
-  `health_from`, `short_image`, `group_key`, `ThemeMode::parse`,
-  `resolve_compose_file`) o cualquier rama nueva.
+  `health_from`, `short_image`, `group_key`, `clip_tail`, `parse_settings`,
+  `ThemeMode::parse`, `resolve_compose_file`) o cualquier rama nueva.
+- El patrón de Enter en campos de texto es `lost_focus && key_pressed(Enter)`
+  (por ejemplo en la Consola); úsalo en vez de capturar teclas globales.
 
 ## Estilo de UI
 
@@ -76,6 +78,9 @@ los sustituyas por validaciones inventadas.
 - Reutiliza `pill`, `dot_pill`, `soft_button`, `summary_card`, `meter` y
   `stat_text` antes de inventar estilos.
 - No añadas blur real: egui no lo tiene; usa superficies/alpha como el resto.
+- Reutiliza `depth_surface`, `primary_button` y `paint_bevel`; no dupliques
+  sombras/biseles a mano. El efecto debe poder apagarse con `depth: false` sin
+  perder legibilidad.
 - Iconos de app en SVG (`assets/`); los iconos de acciones in-app son texto
   accesible, no SVG en runtime (evita dependencias pesadas de renderizado).
 
@@ -91,6 +96,19 @@ Con la app abierta y un watcher SNI:
    ventana debe terminar la app.
 
 No dispares *Detener motor* en las pruebas: apaga todos los contenedores.
+
+## Pruebas manuales de consola
+
+Con un contenedor en marcha:
+
+1. Pulsa **Consola** en su tarjeta; el modal muestra el nombre y el estado.
+2. Escribe `echo hola; uname -s` y pulsa Enter: aparece la salida y el código 0.
+3. Repite con el botón **Ejecutar** y con un comando que falle (`exit 3`):
+   debe mostrarse el código 3.
+4. Prueba un contenedor parado: **Consola** debe estar deshabilitado.
+5. Cierra el modal y reábrelo: el historial del contenedor se conserva (máx. 20).
+
+No ejecutes comandos destructivos dentro del contenedor.
 
 ## Estilo de código
 
@@ -121,6 +139,8 @@ No dispares *Detener motor* en las pruebas: apaga todos los contenedores.
       con 0.
 - [ ] `CINNAMON_DOCKER_COMPOSE` y `--help` muestran la ruta correcta.
 - [ ] Bandeja: cerrar oculta, reabrir y Salir probados.
+- [ ] Consola: Enter, botón, contenedor parado e historial probados.
+- [ ] Ajustes: guardar, reiniciar y verificar `settings.json`; 3D on/off.
 - [ ] No se rompe ningún invariante de `docs/architecture.md` (socket,
       arranque serie + `healthy`, confirmación al detener el motor, no borrar).
 

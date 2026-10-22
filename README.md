@@ -24,14 +24,23 @@ Cinnamon y **cualquier** contenedor o proyecto del daemon, sin terminal.
   `healthy` (timeout 900 s: dos `ng serve` en paralelo agotan la RAM y mueren
   con exit 137); el resto de proyectos usan `docker start` secuencial.
 - **Tarjetas por contenedor** con estado y salud, imagen, uptime, CPU/RAM y
-  acciones Iniciar/Detener/Reiniciar/Logs.
+  acciones Iniciar/Detener/Reiniciar/Logs y **Consola**.
+- **Consola por contenedor**: ejecuta comandos dentro del contenedor con
+  `docker exec <id|name> sh -lc <comando>` desde un modal, sin abrir terminal.
+  Guarda las últimas 20 ejecuciones por contenedor y recorta la salida a 200
+  líneas; Enter o «Ejecutar» lanzan el comando. Cada comando se corta a los
+  60 s y la salida se limita a 1 MiB.
 - **Resumen arriba**: CPU total, RAM total y contenedores; métricas cada 5 s
-  (`docker stats --no-stream`).
+  por defecto (configurable en Ajustes).
+- **Ajustes en caliente** (botón en el header): ruta del compose, refresco de
+  contenedores (1–60 s), métricas (2–120 s) y efecto 3D. Se guardan en
+  `~/.config/cinnamon-docker/settings.json`.
 - **Bandeja SNI**: Abrir panel, Iniciar/Detener motor, Refrescar,
   Levantar/Apagar proyecto seleccionado, Salir. Cerrar la ventana la oculta en
   la bandeja; si no hay bandeja disponible, la ventana cierra con normalidad.
-- **Tema claro/oscuro estilo iOS 26** con selector en el header; la
-  preferencia queda persistida.
+- **Tema claro/oscuro estilo iOS 2026** con selector en el header y efecto 3D
+  sutil en botones, tarjetas y paneles (apagable en Ajustes); la preferencia de
+  tema queda persistida.
 - **Panel de actividad lateral redimensionable** con Copiar, Limpiar y
   auto-scroll.
 - **CLI** para scripts: `--status`, `--containers`, `--help`.
@@ -95,15 +104,15 @@ El paquete portable `cinnamon-docker-<versión>-x86_64-linux.tar.gz` incluye el
 binario, los iconos SVG, el `.desktop`, `install.sh`, el README y la licencia.
 
 ```bash
-tar xzf cinnamon-docker-0.2.0-x86_64-linux.tar.gz
-cd cinnamon-docker-0.2.0-x86_64-linux
+tar xzf cinnamon-docker-0.3.0-x86_64-linux.tar.gz
+cd cinnamon-docker-0.3.0-x86_64-linux
 ./install.sh
 ```
 
 Verifica el checksum desde el directorio que contiene ambos archivos:
 
 ```bash
-sha256sum -c cinnamon-docker-0.2.0-x86_64-linux.tar.gz.sha256
+sha256sum -c cinnamon-docker-0.3.0-x86_64-linux.tar.gz.sha256
 ```
 
 ## Uso
@@ -111,6 +120,9 @@ sha256sum -c cinnamon-docker-0.2.0-x86_64-linux.tar.gz.sha256
 **GUI**: ejecuta `cinnamon-docker`, elige el proyecto en el header,
 levántalo o apágalo con los botones y usa las acciones de cada tarjeta
 (Iniciar/Detener/Reiniciar/Logs).
+
+«Consola» abre un modal para ejecutar comandos dentro del contenedor (sólo si
+está en marcha); «Ajustes» abre la configuración en caliente.
 
 **Bandeja**: el clic izquierdo sobre el icono abre el panel; el menú ofrece
 Abrir panel, Iniciar/Detener motor, Refrescar, Levantar/Apagar proyecto
@@ -131,16 +143,26 @@ reactivaría): muestra el estado del motor y los servicios como `detenido`.
 
 ## Configuración
 
-### Compose de Cinnamon
+### Ajustes y `settings.json`
 
-`CINNAMON_DOCKER_COMPOSE` define la ruta del compose del stack Cinnamon. Si no
-se define, se usa la ruta por defecto del autor:
+El botón **Ajustes** del header edita en caliente:
 
-```bash
-export CINNAMON_DOCKER_COMPOSE="$HOME/proyectos/Cinnamon/docker-compose.yml"
-```
+| Campo | Rango / defecto | Efecto |
+|---|---|---|
+| `compose` | ruta; vacío = entorno/default | Compose usado por `docker compose`. |
+| `refresh_secs` | 1–60, defecto 2 | `docker ps -a` y estado del motor. |
+| `stats_secs` | 2–120, defecto 5 | `docker stats --no-stream`. |
+| `depth` | `true`/`false`, defecto `true` | Efecto 3D en botones, tarjetas y paneles. |
 
-Se lee al arrancar; `cinnamon-docker --help` muestra la ruta efectiva.
+Se guardan en `$XDG_CONFIG_HOME/cinnamon-docker/settings.json` (por defecto
+`~/.config/cinnamon-docker/settings.json`) al pulsar **Guardar cambios**.
+Campos ausentes o inválidos usan el valor por defecto; los números se recortan
+al rango. Si el archivo no se puede escribir, la app sigue funcionando pero no
+recuerda los cambios.
+
+La ruta del compose se resuelve así: `compose` de `settings.json` si no está
+vacío; si no, `CINNAMON_DOCKER_COMPOSE`; si no, la ruta por defecto del autor.
+Cambiar la ruta no reinicia contenedores.
 
 ### Tema
 
@@ -153,12 +175,9 @@ respeta.
 | Constante | Valor | Para qué |
 |---|---|---|
 | `SERVICES` | los 8 servicios Cinnamon | Orden de arranque en serie y columna del CLI. |
-| `REFRESH_EVERY` | 2 s | `docker ps -a` y estado del motor. |
-| `STATS_EVERY` | 5 s | `docker stats --no-stream`. |
+| `DEFAULT_REFRESH_SECS` | 2 s | Valor inicial de `refresh_secs`; editable en Ajustes. |
+| `DEFAULT_STATS_SECS` | 5 s | Valor inicial de `stats_secs`; editable en Ajustes. |
 | `WAIT_TIMEOUT` | 900 s | Espera de `healthy` por servicio. |
-
-El resto de comportamiento se edita en `src/main.rs`: no hay más configuración
-en runtime.
 
 ## Cómo funciona
 
@@ -170,8 +189,10 @@ en [docs/architecture.md](docs/architecture.md). Problemas típicos en
 
 ## Limitaciones y seguridad
 
-- **No borra nada**: sólo `start`/`stop`/`restart`/`logs`/`ps`/`stats` y
-  `compose up -d`. No hay `rm`, `down -v` ni borrado de volúmenes.
+- **La app no borra nada**: sus acciones sólo hacen
+  `start`/`stop`/`restart`/`logs`/`ps`/`stats` y `compose up -d`/`compose stop`.
+  La consola ejecuta lo que tú escribas dentro del contenedor, así que ese
+  riesgo es responsabilidad del comando.
 - **Detener el motor apaga todos los contenedores** de todos los proyectos;
   por eso hay modal de confirmación.
 - **Sin daemon remoto**: sólo el Docker local (`DOCKER_HOST` no se usa).
@@ -180,6 +201,13 @@ en [docs/architecture.md](docs/architecture.md). Problemas típicos en
 - La ruta del compose es configurable por variable de entorno, pero el stack
   Cinnamon sigue teniendo sus 8 servicios en `SERVICES`: para otro stack con
   arranque en serie hay que editar `src/main.rs` y recompilar.
+- **La consola no es un sandbox**: usa `sh -lc` dentro del contenedor y el
+  usuario por defecto de la imagen (a menudo root). No hay TTY: comandos
+  interactivos como `top` o `bash` sin `-c` no funcionan. El comando viaja como
+  un único argumento a `docker exec`, sin shell del host. Los comandos que no
+  terminan se interrumpen a los 60 s.
+- **Consola requiere `sh`** en la imagen del contenedor. Si la imagen no lo
+  trae, usa otra shell o instala una.
 
 ## Contribuir
 

@@ -65,18 +65,47 @@ aplique. La app no usa `sudo` para el CLI de Docker: sólo para `systemctl`.
 
 ## La ruta de compose no existe
 
-La ruta por defecto es la del autor. Si tu proyecto está en otro sitio, define
-`CINNAMON_DOCKER_COMPOSE` antes de arrancar:
+Abre **Ajustes** y escribe la ruta correcta del compose. Se guarda en
+`~/.config/cinnamon-docker/settings.json`; si el campo está vacío se usa
+`CINNAMON_DOCKER_COMPOSE` y, si no, la ruta por defecto.
 
 ```bash
-export CINNAMON_DOCKER_COMPOSE="$HOME/proyectos/Cinnamon/docker-compose.yml"
 cinnamon-docker --help   # muestra la ruta efectiva
 ```
 
-Debe ser un archivo `docker-compose.yml` válido y Docker Compose v2 debe estar
-instalado (`docker compose version`). No hace falta recompilar. Si la variable
-está vacía o no existe, se usa la ruta por defecto. No hay fallback silencioso a
-otra ruta si apunta a un archivo inexistente.
+Debe ser un `docker-compose.yml` válido y Docker Compose v2 debe estar
+instalado (`docker compose version`). Cambiar la ruta no reinicia contenedores.
+
+## La consola no ejecuta o el comando falla
+
+- El botón **Consola** sólo está activo con el contenedor en marcha.
+- Pulsa **Ejecutar** o Enter en el campo; si el campo está vacío no se lanza.
+- La imagen debe traer `sh`: se ejecuta
+  `docker exec <id|name> sh -lc "<comando>"`. Si no existe, prueba otra imagen o
+  instala una shell.
+- No hay TTY. `top`, `bash` interactivo o `vim` no funcionan; usa comandos no
+  interactivos (`ls`, `cat`, `env`, `ps`).
+- El código de salida y la salida combinada (stdout+stderr) aparecen en el
+  modal; la salida se recorta a las últimas 200 líneas. El comando se
+  interrumpe a los 60 s; si necesitas algo más largo, ejecútalo fuera de la
+  consola o divídelo.
+- Reproduce el comando a mano para aislar permisos o rutas:
+  `docker exec <nombre> sh -lc 'echo hola; uname -s'`.
+
+## Ajustes no se guardan
+
+La configuración vive en `~/.config/cinnamon-docker/settings.json` (respeta
+`XDG_CONFIG_HOME`). Si no persiste, revisa permisos del directorio y que
+`HOME`/`XDG_CONFIG_HOME` estén definidos. Un JSON inválido o campos ausentes
+caen en los valores por defecto; los números fuera de rango se recortan a
+1–60 s (refresco) y 2–120 s (métricas). El efecto 3D se apaga con
+`"depth": false`.
+
+## El efecto 3D no se nota
+
+Comprueba **Ajustes → Efecto 3D**. Con `depth: false` los botones y tarjetas se
+pintan planos; el cambio se aplica al guardar. En temas claros el bisel es sutil
+por diseño.
 
 ## No aparece el icono en la bandeja
 
@@ -167,8 +196,9 @@ binario.
 ## Las stats van 5 s por detrás
 
 Es intencionado: `docker stats --no-stream` tarda ~2 s por muestra y corre en
-su propio hilo cada 5 s (`STATS_EVERY`), para no bloquear la UI ni competir con
-el refresco de `docker ps` (2 s). Para un dato puntual:
+su propio hilo con cadencia configurable en **Ajustes** (2–120 s; defecto 5 s),
+para no bloquear la UI ni competir con el refresco de `docker ps` (2 s por
+defecto). Para un dato puntual:
 
 ```bash
 docker stats --no-stream --format json
